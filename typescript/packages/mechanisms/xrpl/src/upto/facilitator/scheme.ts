@@ -101,7 +101,7 @@ export class UptoXrplScheme implements SchemeNetworkFacilitator {
    * Settles the actual consumed amount by submitting the payTo-signed claim.
    *
    * At settle time `requirements.amount` carries the **actual** amount and
-   * `requirements.extra.settlementTransaction` carries the hex blob of the
+   * `payload.settlementTransaction` carries the hex blob of the
    * `PaymentChannelClaim` signed by the `payTo` account.
    *
    * @param payload - Payment payload
@@ -154,9 +154,13 @@ export class UptoXrplScheme implements SchemeNetworkFacilitator {
         return failedSettle("invalid_upto_xrpl_payload_settlement_exceeds_amount", network, payer);
       }
 
-      const settlementBlob = requirements.extra?.settlementTransaction;
+      const settlementBlob = uptoPayload.settlementTransaction;
       if (typeof settlementBlob !== "string" || settlementBlob === "") {
-        return failedSettle("invalid_upto_xrpl_missing_settlement_transaction", network, payer);
+        return failedSettle(
+          "invalid_upto_xrpl_payload_missing_settlement_transaction",
+          network,
+          payer,
+        );
       }
       // A non-integer clock would defeat every window comparison below and
       // give the dedup entry a NaN expiry, which never prunes.
@@ -285,6 +289,13 @@ export class UptoXrplScheme implements SchemeNetworkFacilitator {
         return invalidVerify("invalid_upto_xrpl_payload", payer);
       }
       payer = uptoPayload.payer;
+
+      // The settlement claim is server-owned and settle-time only: the
+      // resource server's payload enrichment adds it after the metered work,
+      // so a claim arriving at verification was supplied by the client.
+      if (phase === "verify" && uptoPayload.settlementTransaction !== undefined) {
+        return invalidVerify("invalid_upto_xrpl_payload_unexpected_settlement_transaction", payer);
+      }
 
       // The claim verifier round-trips drops through an XRP float, where two
       // distinct amounts beyond 2^53 drops collide onto one signing message;

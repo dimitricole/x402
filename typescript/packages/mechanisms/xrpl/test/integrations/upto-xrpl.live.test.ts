@@ -70,6 +70,8 @@ class XrplFacilitatorClient implements FacilitatorClient {
   readonly scheme = "upto";
   readonly network = network;
   readonly x402Version = 2;
+  /** Last payload forwarded to settle; carries the server-enriched claim. */
+  lastSettlePayload?: PaymentPayload;
 
   /**
    * Creates the adapter around a configured x402 facilitator.
@@ -103,6 +105,7 @@ class XrplFacilitatorClient implements FacilitatorClient {
     paymentPayload: PaymentPayload,
     paymentRequirements: PaymentRequirements,
   ): Promise<SettleResponse> {
+    this.lastSettlePayload = paymentPayload;
     return this.facilitator.settle(paymentPayload, paymentRequirements);
   }
 
@@ -146,6 +149,7 @@ describeLive("XRPL upto live settlement", () => {
   let client: x402Client;
   let server: x402ResourceServer;
   let serverScheme: UptoXrplServer;
+  let facilitatorClient: XrplFacilitatorClient;
 
   beforeAll(async () => {
     const xrpl = createXrplClient(network, {});
@@ -163,7 +167,8 @@ describeLive("XRPL upto live settlement", () => {
     );
     const facilitator = new x402Facilitator().register(network, new UptoXrplFacilitator());
     serverScheme = new UptoXrplServer(createXrplWalletSigner(payToWallet));
-    server = new x402ResourceServer(new XrplFacilitatorClient(facilitator));
+    facilitatorClient = new XrplFacilitatorClient(facilitator);
+    server = new x402ResourceServer(facilitatorClient);
     server.register(network, serverScheme);
     await server.initialize();
   }, 120_000);
@@ -212,15 +217,14 @@ describeLive("XRPL upto live settlement", () => {
   }
 
   /**
-   * Reads the fee the payTo account pays for a signed settlement claim.
+   * Reads the fee the payTo account pays for the last settled claim, from the
+   * server-enriched payload the facilitator received.
    *
-   * @param settleRequirements - Settle-time requirements carrying the blob
    * @returns Claim fee in drops
    */
-  function getClaimFeeDrops(settleRequirements: PaymentRequirements): bigint {
-    const claim = decodeSignedTransactionBlob(
-      settleRequirements.extra!.settlementTransaction as string,
-    );
+  function getClaimFeeDrops(): bigint {
+    const uptoPayload = getUptoXrplPayload(facilitatorClient.lastSettlePayload!);
+    const claim = decodeSignedTransactionBlob(uptoPayload!.settlementTransaction as string);
     return BigInt(claim.Fee!);
   }
 
@@ -236,16 +240,16 @@ describeLive("XRPL upto live settlement", () => {
     expect(channel!.Amount).toBe(maxAmount);
     expect(channel!.Balance).toBe("0");
 
-    const settleRequirements = await serverScheme.buildSettlementRequirements(paymentPayload, {
-      ...accepted,
-      amount: settleAmount,
-    });
-
-    // Two concurrent attempts against one claim: exactly one may reach the
+    // Two concurrent attempts against one channel: exactly one may reach the
     // ledger, the other must be refused by the duplicate-settlement guard.
+    // Settlement enrichment signs the claim inside settlePayment.
     const results = await Promise.all([
-      server.settlePayment(paymentPayload, settleRequirements),
-      server.settlePayment(paymentPayload, settleRequirements),
+      server.settlePayment(paymentPayload, accepted, undefined, undefined, {
+        amount: settleAmount,
+      }),
+      server.settlePayment(paymentPayload, accepted, undefined, undefined, {
+        amount: settleAmount,
+      }),
     ]);
     const settled = results.filter(result => result.success);
     const refused = results.filter(result => !result.success);
@@ -259,9 +263,7 @@ describeLive("XRPL upto live settlement", () => {
     // payTo is the claim's transaction Account and pays its fee, so the exact
     // delta nets it out.
     const payToAfter = await getXrpBalanceDrops(payToWallet.classicAddress);
-    expect(payToAfter - payToBefore).toBe(
-      BigInt(settleAmount) - getClaimFeeDrops(settleRequirements),
-    );
+    expect(payToAfter - payToBefore).toBe(BigInt(settleAmount) - getClaimFeeDrops());
     expect(await getPayChannel(channelId, network)).toBeUndefined();
 
     // The payer's only cost beyond the charge is the channel-create fee,
@@ -284,12 +286,9 @@ describeLive("XRPL upto live settlement", () => {
 
     const { paymentPayload, accepted, channelId } = await createVerifiedPayment();
 
-    const settleRequirements = await serverScheme.buildSettlementRequirements(paymentPayload, {
-      ...accepted,
+    const settle = await server.settlePayment(paymentPayload, accepted, undefined, undefined, {
       amount: "0",
     });
-
-    const settle = await server.settlePayment(paymentPayload, settleRequirements);
     expect(settle.success).toBe(true);
     expect(settle.amount).toBe("0");
     expect(settle.transaction).toMatch(/^[A-F0-9]{64}$/);
@@ -297,7 +296,7 @@ describeLive("XRPL upto live settlement", () => {
     // A zero settlement is still an on-ledger close: payTo pays the claim fee
     // and receives nothing.
     const payToAfter = await getXrpBalanceDrops(payToWallet.classicAddress);
-    expect(payToAfter - payToBefore).toBe(-getClaimFeeDrops(settleRequirements));
+    expect(payToAfter - payToBefore).toBe(-getClaimFeeDrops());
     expect(await getPayChannel(channelId, network)).toBeUndefined();
 
     const payerAfter = await getXrpBalanceDrops(payerWallet.classicAddress);

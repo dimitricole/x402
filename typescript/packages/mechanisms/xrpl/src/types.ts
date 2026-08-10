@@ -85,6 +85,13 @@ export type UptoXrplPayload = {
    * Channel `Account`, i.e. the payer's classic address.
    */
   payer: string;
+  /**
+   * Settle-time only: hex blob of the `PaymentChannelClaim` signed by the
+   * `payTo` account, which the facilitator verifies and submits. Added by the
+   * resource server's settlement-payload enrichment; verification rejects a
+   * client-supplied value.
+   */
+  settlementTransaction?: string;
 };
 
 /**
@@ -105,11 +112,6 @@ export type UptoXrplPaymentRequirementsExtra = {
    * against the validated ledger's close time.
    */
   validAfter?: number;
-  /**
-   * Settle-time only: hex blob of the `PaymentChannelClaim` signed by the
-   * `payTo` account, which the facilitator verifies and submits.
-   */
-  settlementTransaction?: string;
 };
 
 /**

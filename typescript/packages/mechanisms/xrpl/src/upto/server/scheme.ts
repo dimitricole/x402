@@ -10,6 +10,7 @@ import type {
   SchemeNetworkServer,
   SupportedKind,
 } from "@x402/core/types";
+import type { SettleContext } from "@x402/core/server";
 import { parseMoneyString } from "@x402/core/utils";
 import { PaymentChannelClaimFlags, type PaymentChannelClaim } from "xrpl";
 import {
@@ -123,10 +124,6 @@ export class UptoXrplScheme implements SchemeNetworkServer {
     if (validAfter != null && !isNonNegativeInteger(validAfter)) {
       throw new Error("XRPL upto payments require extra.validAfter in Unix seconds");
     }
-    // Settle-time only; a challenge must never carry a signed claim.
-    if (paymentRequirements.extra?.settlementTransaction !== undefined) {
-      throw new Error("extra.settlementTransaction must be absent from PAYMENT-REQUIRED");
-    }
 
     return Promise.resolve({
       ...paymentRequirements,
@@ -138,21 +135,26 @@ export class UptoXrplScheme implements SchemeNetworkServer {
   }
 
   /**
-   * Builds the settle-time requirements for a verified upto payment.
+   * Adds the server-signed settlement claim to the settle-time payload.
    *
-   * Called after the metered work has run, with `requirements.amount` set to
-   * the actual charge. Signs the `PaymentChannelClaim` that closes the
-   * channel and returns the requirements with the blob in
-   * `extra.settlementTransaction`, ready for the facilitator's `/settle`.
+   * Called once per settle after the metered work has run, with
+   * `ctx.requirements.amount` set to the actual charge (core applies
+   * `settlementOverrides.amount` before this hook). Signs the
+   * `PaymentChannelClaim` that closes the channel and returns the blob as
+   * `settlementTransaction`, which core merges additively into the payment
+   * payload sent to the facilitator's `/settle`.
    *
-   * @param paymentPayload - Verified x402 payment payload
-   * @param requirements - Payment requirements with amount set to the actual charge
-   * @returns Settle-time payment requirements
+   * @param ctx - Settlement context for the current payment
+   * @returns Additive payload fields carrying the signed claim
    */
-  async buildSettlementRequirements(
-    paymentPayload: PaymentPayload,
-    requirements: PaymentRequirements,
-  ): Promise<PaymentRequirements> {
+  enrichSettlementPayload = async (ctx: SettleContext): Promise<Record<string, unknown> | void> => {
+    // The upto flow is authorization-only: the sole settle runs after the
+    // handler. Never attach a claim on any other phase.
+    if (ctx.phase !== "after-handler") {
+      return;
+    }
+    const paymentPayload = ctx.paymentPayload as PaymentPayload;
+    const requirements = ctx.requirements as PaymentRequirements;
     if (requirements.scheme !== "upto") {
       throw new Error(`Unsupported scheme: ${requirements.scheme}`);
     }
@@ -182,14 +184,8 @@ export class UptoXrplScheme implements SchemeNetworkServer {
     this.validatePreparedSettlementTransaction(prepared, requirements.network);
     const signed = await this.signer.sign(prepared);
 
-    return {
-      ...requirements,
-      extra: {
-        ...requirements.extra,
-        settlementTransaction: signed.signedTxBlob,
-      },
-    };
-  }
+    return { settlementTransaction: signed.signedTxBlob };
+  };
 
   /**
    * Builds the unsigned settlement claim per the scheme's binding rules.

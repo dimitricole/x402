@@ -29,6 +29,7 @@ import type {
   XrplFacilitatorOptions,
 } from "../../src";
 import type { PaymentPayload, PaymentRequirements } from "@x402/core/types";
+import type { SettleContext, SettlePhase } from "@x402/core/server";
 import type { Client, PaymentChannelClaim, PaymentChannelCreate, TransactionMetadata } from "xrpl";
 
 const payerWallet = Wallet.fromSeed("sEdTM1uX8pu2do5XvTnutH6HsouMaM2");
@@ -150,13 +151,27 @@ function signSettlement(
   return signer.sign(claim).tx_blob;
 }
 
-function settleRequirements(actual: string, settlementTransaction?: string): PaymentRequirements {
-  return makeRequirements({
-    amount: actual,
-    extra: {
-      settlementTransaction: settlementTransaction ?? signSettlement(actual),
-    },
+function settleRequirements(actual: string): PaymentRequirements {
+  return makeRequirements({ amount: actual });
+}
+
+function settlePayload(
+  actual: string,
+  settlementTransaction?: string,
+  payloadOverrides: Record<string, unknown> = {},
+): PaymentPayload {
+  return makePayload({
+    settlementTransaction: settlementTransaction ?? signSettlement(actual),
+    ...payloadOverrides,
   });
+}
+
+function settleContext(
+  paymentPayload: PaymentPayload,
+  requirements: PaymentRequirements,
+  phase: SettlePhase = "after-handler",
+): SettleContext {
+  return { paymentPayload, requirements, declaredExtensions: {}, phase } as SettleContext;
 }
 
 function claimMeta(finalBalance: string, channelId: string = CHANNEL): TransactionMetadata {
@@ -267,6 +282,18 @@ describe("UptoXrplScheme facilitator verify", () => {
     expect(result.invalidReason).toBe("invalid_upto_xrpl_payload");
   });
 
+  it("rejects a client-supplied settlement transaction", async () => {
+    // The settlement claim is server-owned and settle-time only: the resource
+    // server's payload enrichment adds it after the metered work has run.
+    const result = await createFacilitator().verify(
+      makePayload({ settlementTransaction: signSettlement("2500000") }),
+      baseRequirements,
+    );
+    expect(result.invalidReason).toBe(
+      "invalid_upto_xrpl_payload_unexpected_settlement_transaction",
+    );
+  });
+
   it("rejects accepted terms whose amount differs", async () => {
     const result = await createFacilitator().verify(
       makePayload({}, makeRequirements({ amount: "1" })),
@@ -347,12 +374,8 @@ describe("UptoXrplScheme facilitator verify", () => {
           continue;
         }
         const settled = await facilitator.settle(
-          makePayload({}, requirements),
-          makeRequirements({
-            maxTimeoutSeconds,
-            amount: "2500000",
-            extra: { settlementTransaction: signSettlement("2500000") },
-          }),
+          makePayload({ settlementTransaction: signSettlement("2500000") }, requirements),
+          makeRequirements({ maxTimeoutSeconds, amount: "2500000" }),
         );
         expect(settled.success).toBe(true);
       }
@@ -668,7 +691,10 @@ describe("UptoXrplScheme facilitator verify", () => {
 
 describe("UptoXrplScheme facilitator settle", () => {
   it("settles the actual amount with a payTo-signed claim", async () => {
-    const result = await createFacilitator().settle(makePayload(), settleRequirements("2500000"));
+    const result = await createFacilitator().settle(
+      settlePayload("2500000"),
+      settleRequirements("2500000"),
+    );
     expect(result.success).toBe(true);
     expect(result.transaction).toBe("ABC");
     expect(result.payer).toBe(payerWallet.classicAddress);
@@ -678,7 +704,7 @@ describe("UptoXrplScheme facilitator settle", () => {
   it("settles zero as a bare destination close", async () => {
     // A zero close is still an on-ledger transaction, so the response
     // carries its hash like any other settlement.
-    const result = await createFacilitator().settle(makePayload(), settleRequirements("0"));
+    const result = await createFacilitator().settle(settlePayload("0"), settleRequirements("0"));
     expect(result.success).toBe(true);
     expect(result.transaction).toBe("ABC");
     expect(result.amount).toBe("0");
@@ -693,29 +719,31 @@ describe("UptoXrplScheme facilitator settle", () => {
       Signature: VALID_SIGNATURE,
       PublicKey: payerWallet.publicKey,
     });
-    const result = await createFacilitator().settle(makePayload(), settleRequirements("0", blob));
+    const result = await createFacilitator().settle(
+      settlePayload("0", blob),
+      settleRequirements("0"),
+    );
     expect(result.errorReason).toBe("invalid_upto_xrpl_settlement_transaction_mismatch");
     expect(result.errorMessage).toContain("bare close");
   });
 
   it("rejects a settlement without a settlement transaction", async () => {
-    const requirements = makeRequirements({ amount: "2500000" });
-    const result = await createFacilitator().settle(makePayload(), requirements);
-    expect(result.errorReason).toBe("invalid_upto_xrpl_missing_settlement_transaction");
+    const result = await createFacilitator().settle(makePayload(), settleRequirements("2500000"));
+    expect(result.errorReason).toBe("invalid_upto_xrpl_payload_missing_settlement_transaction");
   });
 
   it("rejects a settlement above the authorized maximum", async () => {
     const result = await createFacilitator().settle(
-      makePayload(),
-      settleRequirements("50000000", signSettlement("50000000", { Amount: "50000000" })),
+      settlePayload("50000000", signSettlement("50000000", { Amount: "50000000" })),
+      settleRequirements("50000000"),
     );
     expect(result.errorReason).toBe("invalid_upto_xrpl_payload_settlement_exceeds_amount");
   });
 
   it("rejects a non-numeric settlement amount, keeping the payer", async () => {
     const result = await createFacilitator().settle(
-      makePayload(),
-      settleRequirements("not-a-number", signSettlement("2500000")),
+      settlePayload("not-a-number", signSettlement("2500000")),
+      settleRequirements("not-a-number"),
     );
     expect(result.errorReason).toBe("invalid_upto_xrpl_settlement_amount");
     expect(result.payer).toBe(payerWallet.classicAddress);
@@ -723,8 +751,8 @@ describe("UptoXrplScheme facilitator settle", () => {
 
   it("rejects a fractional settlement amount", async () => {
     const result = await createFacilitator().settle(
-      makePayload(),
-      settleRequirements("1.5", signSettlement("2500000")),
+      settlePayload("1.5", signSettlement("2500000")),
+      settleRequirements("1.5"),
     );
     expect(result.errorReason).toBe("invalid_upto_xrpl_settlement_amount");
   });
@@ -732,8 +760,8 @@ describe("UptoXrplScheme facilitator settle", () => {
   it("rejects a claim whose Account is not payTo", async () => {
     const blob = signSettlement("2500000", { Account: otherWallet.classicAddress });
     const result = await createFacilitator().settle(
-      makePayload(),
-      settleRequirements("2500000", blob),
+      settlePayload("2500000", blob),
+      settleRequirements("2500000"),
     );
     expect(result.errorReason).toBe("invalid_upto_xrpl_settlement_transaction_mismatch");
     expect(result.errorMessage).toContain("payTo");
@@ -742,8 +770,8 @@ describe("UptoXrplScheme facilitator settle", () => {
   it("rejects a claim whose Balance is not the settlement amount", async () => {
     const blob = signSettlement("2500000", { Balance: "2400000" });
     const result = await createFacilitator().settle(
-      makePayload(),
-      settleRequirements("2500000", blob),
+      settlePayload("2500000", blob),
+      settleRequirements("2500000"),
     );
     expect(result.errorReason).toBe("invalid_upto_xrpl_settlement_transaction_mismatch");
     expect(result.errorMessage).toContain("Balance");
@@ -752,8 +780,8 @@ describe("UptoXrplScheme facilitator settle", () => {
   it("rejects a claim whose Amount is not the authorized maximum", async () => {
     const blob = signSettlement("2500000", { Amount: "9000000" });
     const result = await createFacilitator().settle(
-      makePayload(),
-      settleRequirements("2500000", blob),
+      settlePayload("2500000", blob),
+      settleRequirements("2500000"),
     );
     expect(result.errorReason).toBe("invalid_upto_xrpl_settlement_transaction_mismatch");
     expect(result.errorMessage).toContain("authorized maximum");
@@ -762,8 +790,8 @@ describe("UptoXrplScheme facilitator settle", () => {
   it("rejects a claim without tfClose", async () => {
     const blob = signSettlement("2500000", { Flags: 0 });
     const result = await createFacilitator().settle(
-      makePayload(),
-      settleRequirements("2500000", blob),
+      settlePayload("2500000", blob),
+      settleRequirements("2500000"),
     );
     expect(result.errorReason).toBe("invalid_upto_xrpl_settlement_transaction_mismatch");
     expect(result.errorMessage).toContain("tfClose");
@@ -772,8 +800,8 @@ describe("UptoXrplScheme facilitator settle", () => {
   it("rejects a claim whose LastLedgerSequence has already passed", async () => {
     const blob = signSettlement("2500000", { LastLedgerSequence: CURRENT_LEDGER });
     const result = await createFacilitator().settle(
-      makePayload(),
-      settleRequirements("2500000", blob),
+      settlePayload("2500000", blob),
+      settleRequirements("2500000"),
     );
     expect(result.errorMessage).toContain("already passed");
   });
@@ -782,18 +810,10 @@ describe("UptoXrplScheme facilitator settle", () => {
     // The bound must admit the fixed offset client.autofill() applies; see
     // XRPL_AUTOFILL_LEDGER_OFFSET.
     for (const maxTimeoutSeconds of [30, 60, 85, 300]) {
-      const requirements = makeRequirements({
-        maxTimeoutSeconds,
-        amount: "2500000",
-        extra: {
-          settlementTransaction: signSettlement("2500000", {
-            LastLedgerSequence: CURRENT_LEDGER + 20,
-          }),
-        },
-      });
+      const blob = signSettlement("2500000", { LastLedgerSequence: CURRENT_LEDGER + 20 });
       const result = await createFacilitator().settle(
-        makePayload({}, makeRequirements({ maxTimeoutSeconds })),
-        requirements,
+        makePayload({ settlementTransaction: blob }, makeRequirements({ maxTimeoutSeconds })),
+        makeRequirements({ maxTimeoutSeconds, amount: "2500000" }),
       );
       expect(result.success).toBe(true);
     }
@@ -802,8 +822,8 @@ describe("UptoXrplScheme facilitator settle", () => {
   it("rejects a claim landable beyond the settlement window", async () => {
     const blob = signSettlement("2500000", { LastLedgerSequence: CURRENT_LEDGER + 10_000 });
     const result = await createFacilitator().settle(
-      makePayload(),
-      settleRequirements("2500000", blob),
+      settlePayload("2500000", blob),
+      settleRequirements("2500000"),
     );
     expect(result.errorMessage).toContain("beyond the settlement window");
   });
@@ -812,7 +832,7 @@ describe("UptoXrplScheme facilitator settle", () => {
     const accepted = makeRequirements();
     (accepted as { network: unknown }).network = { evil: true };
     const result = await createFacilitator().settle(
-      makePayload({}, accepted),
+      makePayload({ settlementTransaction: signSettlement("2500000") }, accepted),
       settleRequirements("2500000"),
     );
     expect(result.success).toBe(false);
@@ -822,8 +842,8 @@ describe("UptoXrplScheme facilitator settle", () => {
   it("rejects a claim without LastLedgerSequence", async () => {
     const blob = signSettlement("2500000", { LastLedgerSequence: undefined });
     const result = await createFacilitator().settle(
-      makePayload(),
-      settleRequirements("2500000", blob),
+      settlePayload("2500000", blob),
+      settleRequirements("2500000"),
     );
     expect(result.errorReason).toBe("invalid_upto_xrpl_settlement_transaction_mismatch");
     expect(result.errorMessage).toContain("LastLedgerSequence");
@@ -840,8 +860,8 @@ describe("UptoXrplScheme facilitator settle", () => {
       LastLedgerSequence: 1_000,
     }).tx_blob;
     const result = await createFacilitator().settle(
-      makePayload(),
-      settleRequirements("2500000", payment),
+      settlePayload("2500000", payment),
+      settleRequirements("2500000"),
     );
     expect(result.errorReason).toBe("invalid_upto_xrpl_settlement_transaction_mismatch");
     expect(result.errorMessage).toContain("not a PaymentChannelClaim");
@@ -849,16 +869,16 @@ describe("UptoXrplScheme facilitator settle", () => {
 
   it("rejects an undecodable settlement transaction", async () => {
     const result = await createFacilitator().settle(
-      makePayload(),
-      settleRequirements("2500000", "not-hex"),
+      settlePayload("2500000", "not-hex"),
+      settleRequirements("2500000"),
     );
     expect(result.errorReason).toBe("invalid_upto_xrpl_settlement_transaction_mismatch");
   });
 
   it("rejects an odd-length settlement blob rather than submitting unvalidated bytes", async () => {
     const result = await createFacilitator().settle(
-      makePayload(),
-      settleRequirements("2500000", `${signSettlement("2500000")}A`),
+      settlePayload("2500000", `${signSettlement("2500000")}A`),
+      settleRequirements("2500000"),
     );
     expect(result.errorReason).toBe("invalid_upto_xrpl_settlement_transaction_mismatch");
   });
@@ -866,8 +886,8 @@ describe("UptoXrplScheme facilitator settle", () => {
   it("rejects a claim whose Channel is not the payload channel", async () => {
     const blob = signSettlement("2500000", { Channel: CHANNEL.replace(/^C/, "D") });
     const result = await createFacilitator().settle(
-      makePayload(),
-      settleRequirements("2500000", blob),
+      settlePayload("2500000", blob),
+      settleRequirements("2500000"),
     );
     expect(result.errorMessage).toContain("Channel mismatch");
   });
@@ -875,20 +895,22 @@ describe("UptoXrplScheme facilitator settle", () => {
   it("rejects a claim carrying NetworkID on a standard network", async () => {
     const blob = signSettlement("2500000", { NetworkID: 1 });
     const result = await createFacilitator().settle(
-      makePayload(),
-      settleRequirements("2500000", blob),
+      settlePayload("2500000", blob),
+      settleRequirements("2500000"),
     );
     expect(result.errorMessage).toContain("NetworkID");
   });
 
   it("accepts a claim carrying the NetworkID of a custom network", async () => {
     const accepted = makeRequirements({ network: "xrpl:1025" });
-    const requirements = makeRequirements({
-      network: "xrpl:1025",
-      amount: "2500000",
-      extra: { settlementTransaction: signSettlement("2500000", { NetworkID: 1025 }) },
-    });
-    const result = await createFacilitator().settle(makePayload({}, accepted), requirements);
+    const requirements = makeRequirements({ network: "xrpl:1025", amount: "2500000" });
+    const result = await createFacilitator().settle(
+      makePayload(
+        { settlementTransaction: signSettlement("2500000", { NetworkID: 1025 }) },
+        accepted,
+      ),
+      requirements,
+    );
     expect(result.success).toBe(true);
   });
 
@@ -896,12 +918,11 @@ describe("UptoXrplScheme facilitator settle", () => {
     // A claim without NetworkID would be valid on every custom network at
     // once; rippled requires it above id 1024.
     const accepted = makeRequirements({ network: "xrpl:1025" });
-    const requirements = makeRequirements({
-      network: "xrpl:1025",
-      amount: "2500000",
-      extra: { settlementTransaction: signSettlement("2500000") },
-    });
-    const result = await createFacilitator().settle(makePayload({}, accepted), requirements);
+    const requirements = makeRequirements({ network: "xrpl:1025", amount: "2500000" });
+    const result = await createFacilitator().settle(
+      makePayload({ settlementTransaction: signSettlement("2500000") }, accepted),
+      requirements,
+    );
     expect(result.errorReason).toBe("invalid_upto_xrpl_settlement_transaction_mismatch");
     expect(result.errorMessage).toContain("NetworkID");
   });
@@ -911,8 +932,8 @@ describe("UptoXrplScheme facilitator settle", () => {
       Flags: PaymentChannelClaimFlags.tfClose | PaymentChannelClaimFlags.tfRenew,
     });
     const result = await createFacilitator().settle(
-      makePayload(),
-      settleRequirements("2500000", blob),
+      settlePayload("2500000", blob),
+      settleRequirements("2500000"),
     );
     expect(result.errorMessage).toContain("tfRenew");
   });
@@ -922,8 +943,8 @@ describe("UptoXrplScheme facilitator settle", () => {
       Signature: authorizeChannel(payerWallet, CHANNEL, "2500000"),
     });
     const result = await createFacilitator().settle(
-      makePayload(),
-      settleRequirements("2500000", blob),
+      settlePayload("2500000", blob),
+      settleRequirements("2500000"),
     );
     expect(result.errorMessage).toContain("payer claim signature");
   });
@@ -931,8 +952,8 @@ describe("UptoXrplScheme facilitator settle", () => {
   it("rejects a claim carrying a different channel public key", async () => {
     const blob = signSettlement("2500000", { PublicKey: otherWallet.publicKey });
     const result = await createFacilitator().settle(
-      makePayload(),
-      settleRequirements("2500000", blob),
+      settlePayload("2500000", blob),
+      settleRequirements("2500000"),
     );
     expect(result.errorMessage).toContain("PublicKey mismatch");
   });
@@ -942,8 +963,8 @@ describe("UptoXrplScheme facilitator settle", () => {
     const decoded = decode(blob);
     decoded.Delegate = otherWallet.classicAddress;
     const result = await createFacilitator().settle(
-      makePayload(),
-      settleRequirements("2500000", encode(decoded)),
+      settlePayload("2500000", encode(decoded)),
+      settleRequirements("2500000"),
     );
     expect(result.errorReason).toBe("invalid_upto_xrpl_settlement_transaction_mismatch");
     expect(result.errorMessage).toContain("Delegate");
@@ -954,8 +975,8 @@ describe("UptoXrplScheme facilitator settle", () => {
     const decoded = decode(blob);
     decoded.Signers = [];
     const result = await createFacilitator().settle(
-      makePayload(),
-      settleRequirements("2500000", encode(decoded)),
+      settlePayload("2500000", encode(decoded)),
+      settleRequirements("2500000"),
     );
     expect(result.errorReason).toBe("invalid_upto_xrpl_settlement_transaction_mismatch");
   });
@@ -965,8 +986,8 @@ describe("UptoXrplScheme facilitator settle", () => {
     const decoded = decode(blob);
     decoded.SigningPubKey = `02${"00".repeat(32)}`;
     const result = await createFacilitator().settle(
-      makePayload(),
-      settleRequirements("2500000", encode(decoded)),
+      settlePayload("2500000", encode(decoded)),
+      settleRequirements("2500000"),
     );
     expect(result.errorReason).toBe("invalid_upto_xrpl_settlement_transaction_mismatch");
     expect(result.errorMessage).toContain("transaction signature invalid");
@@ -979,8 +1000,8 @@ describe("UptoXrplScheme facilitator settle", () => {
     const decoded = decode(blob);
     decoded.SigningPubKey = `04${"11".repeat(64)}`;
     const result = await createFacilitator().settle(
-      makePayload(),
-      settleRequirements("2500000", encode(decoded)),
+      settlePayload("2500000", encode(decoded)),
+      settleRequirements("2500000"),
     );
     expect(result.errorReason).toBe("invalid_upto_xrpl_settlement_transaction_mismatch");
     expect(result.errorMessage).toContain("non-canonical");
@@ -989,14 +1010,14 @@ describe("UptoXrplScheme facilitator settle", () => {
   it("rejects a claim signed by the payTo master key when it is disabled", async () => {
     const result = await createFacilitator({
       getAccountAuthorization: async () => ({ isMasterKeyDisabled: true }),
-    }).settle(makePayload(), settleRequirements("2500000"));
+    }).settle(settlePayload("2500000"), settleRequirements("2500000"));
     expect(result.errorReason).toBe("invalid_upto_xrpl_settlement_signer_not_authorized");
   });
 
   it("re-verifies the channel bindings at settle time", async () => {
     const result = await createFacilitator({
       getPayChannel: async () => makeChannel({ Destination: otherWallet.classicAddress }),
-    }).settle(makePayload(), settleRequirements("2500000"));
+    }).settle(settlePayload("2500000"), settleRequirements("2500000"));
     expect(result.errorReason).toBe("invalid_upto_xrpl_destination_mismatch");
   });
 
@@ -1006,8 +1027,10 @@ describe("UptoXrplScheme facilitator settle", () => {
     // re-check over (channelId, maxAmount) can.
     const wrongSignature = authorizeChannel(payerWallet, CHANNEL, "10000001");
     const result = await createFacilitator().settle(
-      makePayload({ signature: wrongSignature }),
-      settleRequirements("2500000", signSettlement("2500000", { Signature: wrongSignature })),
+      settlePayload("2500000", signSettlement("2500000", { Signature: wrongSignature }), {
+        signature: wrongSignature,
+      }),
+      settleRequirements("2500000"),
     );
     expect(result.success).toBe(false);
     expect(result.errorReason).toBe("invalid_upto_xrpl_claim_signature");
@@ -1017,11 +1040,10 @@ describe("UptoXrplScheme facilitator settle", () => {
     // The payload and blob agree on the substituted key; only the re-check
     // against the channel's own PublicKey can refuse it.
     const result = await createFacilitator().settle(
-      makePayload({ publicKey: otherWallet.publicKey }),
-      settleRequirements(
-        "2500000",
-        signSettlement("2500000", { PublicKey: otherWallet.publicKey }),
-      ),
+      settlePayload("2500000", signSettlement("2500000", { PublicKey: otherWallet.publicKey }), {
+        publicKey: otherWallet.publicKey,
+      }),
+      settleRequirements("2500000"),
     );
     expect(result.success).toBe(false);
     expect(result.errorReason).toBe("invalid_upto_xrpl_public_key_mismatch");
@@ -1030,35 +1052,35 @@ describe("UptoXrplScheme facilitator settle", () => {
   it("settles over a channel the payer partly drew after verification", async () => {
     const result = await createFacilitator({
       getPayChannel: async () => makeChannel({ Balance: "1" }),
-    }).settle(makePayload(), settleRequirements("2500000"));
+    }).settle(settlePayload("2500000"), settleRequirements("2500000"));
     expect(result.success).toBe(true);
   });
 
   it("rejects a settlement the channel has already delivered", async () => {
     const result = await createFacilitator({
       getPayChannel: async () => makeChannel({ Balance: "2500000" }),
-    }).settle(makePayload(), settleRequirements("2500000"));
+    }).settle(settlePayload("2500000"), settleRequirements("2500000"));
     expect(result.errorReason).toBe("invalid_upto_xrpl_channel_already_drawn");
   });
 
   it("settles a channel whose pending close has not yet taken effect", async () => {
     const result = await createFacilitator({
       getPayChannel: async () => makeChannel({ Expiration: CLOSE_TIME + 3_600 }),
-    }).settle(makePayload(), settleRequirements("2500000"));
+    }).settle(settlePayload("2500000"), settleRequirements("2500000"));
     expect(result.success).toBe(true);
   });
 
   it("rejects a settlement on a channel whose close has taken effect", async () => {
     const result = await createFacilitator({
       getPayChannel: async () => makeChannel({ Expiration: CLOSE_TIME }),
-    }).settle(makePayload(), settleRequirements("2500000"));
+    }).settle(settlePayload("2500000"), settleRequirements("2500000"));
     expect(result.errorReason).toBe("invalid_upto_xrpl_channel_expired");
   });
 
   it("settles a channel whose remaining headroom is under maxTimeoutSeconds", async () => {
     const result = await createFacilitator({
       getPayChannel: async () => makeChannel({ CancelAfter: CLOSE_TIME + 60 }),
-    }).settle(makePayload(), settleRequirements("2500000"));
+    }).settle(settlePayload("2500000"), settleRequirements("2500000"));
     expect(result.success).toBe(true);
   });
 
@@ -1067,14 +1089,14 @@ describe("UptoXrplScheme facilitator settle", () => {
     // the metered work consumed its full maxTimeoutSeconds budget.
     const result = await createFacilitator({
       getPayChannel: async () => makeChannel({ CancelAfter: CLOSE_TIME + LANDING_MARGIN_SECONDS }),
-    }).settle(makePayload(), settleRequirements("2500000"));
+    }).settle(settlePayload("2500000"), settleRequirements("2500000"));
     expect(result.success).toBe(true);
   });
 
   it("rejects a settlement on a channel expiring before the claim can land", async () => {
     const result = await createFacilitator({
       getPayChannel: async () => makeChannel({ CancelAfter: CLOSE_TIME + 5 }),
-    }).settle(makePayload(), settleRequirements("2500000"));
+    }).settle(settlePayload("2500000"), settleRequirements("2500000"));
     expect(result.errorReason).toBe("invalid_upto_xrpl_channel_expired");
   });
 
@@ -1090,8 +1112,8 @@ describe("UptoXrplScheme facilitator settle", () => {
   it("rejects a claim signed by a key not authorized for payTo", async () => {
     const blob = signSettlement("2500000", {}, otherWallet);
     const result = await createFacilitator().settle(
-      makePayload(),
-      settleRequirements("2500000", blob),
+      settlePayload("2500000", blob),
+      settleRequirements("2500000"),
     );
     expect(result.errorReason).toBe("invalid_upto_xrpl_settlement_signer_not_authorized");
   });
@@ -1103,7 +1125,7 @@ describe("UptoXrplScheme facilitator settle", () => {
         regularKey: otherWallet.classicAddress,
         isMasterKeyDisabled: true,
       }),
-    }).settle(makePayload(), settleRequirements("2500000", blob));
+    }).settle(settlePayload("2500000", blob), settleRequirements("2500000"));
     expect(result.success).toBe(true);
   });
 
@@ -1114,7 +1136,7 @@ describe("UptoXrplScheme facilitator settle", () => {
         validated: false,
         resultCode: "tesSUCCESS",
       }),
-    }).settle(makePayload(), settleRequirements("2500000"));
+    }).settle(settlePayload("2500000"), settleRequirements("2500000"));
     expect(result.success).toBe(false);
     expect(result.errorReason).toBe("transaction_failed: tesSUCCESS");
   });
@@ -1124,7 +1146,7 @@ describe("UptoXrplScheme facilitator settle", () => {
       submitSignedTransaction: async () => {
         throw new Error("ECONNRESET");
       },
-    }).settle(makePayload(), settleRequirements("2500000"));
+    }).settle(settlePayload("2500000"), settleRequirements("2500000"));
     expect(result.success).toBe(false);
     expect(result.errorReason).toBe("transaction_failed: ECONNRESET");
     expect(result.payer).toBe(payerWallet.classicAddress);
@@ -1133,7 +1155,7 @@ describe("UptoXrplScheme facilitator settle", () => {
   it("reports an unusable ledger index as a facilitator error", async () => {
     const result = await createFacilitator({
       getCurrentLedgerIndex: async () => Number.NaN,
-    }).settle(makePayload(), settleRequirements("2500000"));
+    }).settle(settlePayload("2500000"), settleRequirements("2500000"));
     expect(result.errorReason).toBe("invalid_upto_xrpl_facilitator_error");
   });
 
@@ -1142,7 +1164,7 @@ describe("UptoXrplScheme facilitator settle", () => {
     // accepts must not be refused.
     const result = await createFacilitator({
       getPayChannel: async () => makeChannel({ SettleDelay: 30 }),
-    }).settle(makePayload(), settleRequirements("2500000"));
+    }).settle(settlePayload("2500000"), settleRequirements("2500000"));
     expect(result.success).toBe(true);
   });
 
@@ -1154,7 +1176,7 @@ describe("UptoXrplScheme facilitator settle", () => {
         resultCode: "tesSUCCESS",
         meta: claimMeta("2500000"),
       }),
-    }).settle(makePayload(), settleRequirements("2500000"));
+    }).settle(settlePayload("2500000"), settleRequirements("2500000"));
     expect(result.success).toBe(true);
   });
 
@@ -1167,7 +1189,7 @@ describe("UptoXrplScheme facilitator settle", () => {
         resultCode: "tesSUCCESS",
         meta: claimMeta("0"),
       }),
-    }).settle(makePayload(), settleRequirements("2500000"));
+    }).settle(settlePayload("2500000"), settleRequirements("2500000"));
     expect(result.success).toBe(false);
     expect(result.errorReason).toBe("transaction_failed: channel_expired_before_claim");
     expect(result.transaction).toBe("ABC");
@@ -1196,7 +1218,7 @@ describe("UptoXrplScheme facilitator settle", () => {
         resultCode: "tesSUCCESS",
         meta,
       }),
-    }).settle(makePayload(), settleRequirements("2500000"));
+    }).settle(settlePayload("2500000"), settleRequirements("2500000"));
     expect(result.errorReason).toBe("transaction_failed: channel_expired_before_claim");
   });
 
@@ -1208,7 +1230,7 @@ describe("UptoXrplScheme facilitator settle", () => {
         resultCode: "tesSUCCESS",
         meta: claimMeta("0", CHANNEL.replace(/^C/, "D")),
       }),
-    }).settle(makePayload(), settleRequirements("2500000"));
+    }).settle(settlePayload("2500000"), settleRequirements("2500000"));
     expect(result.success).toBe(true);
   });
 
@@ -1220,7 +1242,7 @@ describe("UptoXrplScheme facilitator settle", () => {
         resultCode: "tesSUCCESS",
         meta: { AffectedNodes: 42 } as unknown as TransactionMetadata,
       }),
-    }).settle(makePayload(), settleRequirements("2500000"));
+    }).settle(settlePayload("2500000"), settleRequirements("2500000"));
     expect(result.success).toBe(true);
   });
 
@@ -1245,7 +1267,7 @@ describe("UptoXrplScheme facilitator settle", () => {
         resultCode: "tesSUCCESS",
         meta,
       }),
-    }).settle(makePayload(), settleRequirements("2500000"));
+    }).settle(settlePayload("2500000"), settleRequirements("2500000"));
     expect(result.success).toBe(true);
   });
 
@@ -1258,7 +1280,7 @@ describe("UptoXrplScheme facilitator settle", () => {
         resultCode: "tesSUCCESS",
         meta: claimMeta("0"),
       }),
-    }).settle(makePayload(), settleRequirements("0"));
+    }).settle(settlePayload("0"), settleRequirements("0"));
     expect(result.success).toBe(true);
   });
 });
@@ -1266,9 +1288,10 @@ describe("UptoXrplScheme facilitator settle", () => {
 describe("UptoXrplScheme facilitator settlement dedup", () => {
   it("rejects a duplicate settlement on the same channel", async () => {
     const facilitator = createFacilitator();
+    const payload = settlePayload("2500000");
     const requirements = settleRequirements("2500000");
-    expect((await facilitator.settle(makePayload(), requirements)).success).toBe(true);
-    const second = await facilitator.settle(makePayload(), requirements);
+    expect((await facilitator.settle(payload, requirements)).success).toBe(true);
+    const second = await facilitator.settle(payload, requirements);
     expect(second.success).toBe(false);
     expect(second.errorReason).toBe("duplicate_settlement");
   });
@@ -1278,15 +1301,12 @@ describe("UptoXrplScheme facilitator settlement dedup", () => {
     // corrected retry must not be told it is a duplicate.
     const facilitator = createFacilitator();
     const rejected = await facilitator.settle(
-      makePayload(),
-      settleRequirements(
-        "2500000",
-        signSettlement("2500000", { Channel: CHANNEL.replace(/^C/, "D") }),
-      ),
+      settlePayload("2500000", signSettlement("2500000", { Channel: CHANNEL.replace(/^C/, "D") })),
+      settleRequirements("2500000"),
     );
     expect(rejected.errorReason).toBe("invalid_upto_xrpl_settlement_transaction_mismatch");
 
-    const retry = await facilitator.settle(makePayload(), settleRequirements("2500000"));
+    const retry = await facilitator.settle(settlePayload("2500000"), settleRequirements("2500000"));
     expect(retry.errorReason).not.toBe("duplicate_settlement");
     expect(retry.success).toBe(true);
   });
@@ -1296,12 +1316,13 @@ describe("UptoXrplScheme facilitator settlement dedup", () => {
     const facilitator = createFacilitator({
       submitSignedTransaction: async () => ({ hash: "ABC", validated: true, resultCode }),
     });
+    const payload = settlePayload("2500000");
     const requirements = settleRequirements("2500000");
-    const first = await facilitator.settle(makePayload(), requirements);
+    const first = await facilitator.settle(payload, requirements);
     expect(first.errorReason).toBe("transaction_failed: tecNO_TARGET");
 
     resultCode = "tesSUCCESS";
-    const retry = await facilitator.settle(makePayload(), requirements);
+    const retry = await facilitator.settle(payload, requirements);
     expect(retry.success).toBe(true);
   });
 
@@ -1317,11 +1338,14 @@ describe("UptoXrplScheme facilitator settlement dedup", () => {
         return { hash: "ABC", validated, resultCode: "tesSUCCESS" };
       },
     });
-    const first = await facilitator.settle(makePayload(), settleRequirements("2500000"));
+    const first = await facilitator.settle(settlePayload("2500000"), settleRequirements("2500000"));
     expect(first.success).toBe(false);
 
     validated = true;
-    const second = await facilitator.settle(makePayload(), settleRequirements(MAX_DROPS));
+    const second = await facilitator.settle(
+      settlePayload(MAX_DROPS),
+      settleRequirements(MAX_DROPS),
+    );
     expect(second.errorReason).toBe("duplicate_settlement");
     expect(submitted).toHaveLength(1);
   });
@@ -1336,11 +1360,12 @@ describe("UptoXrplScheme facilitator settlement dedup", () => {
         return { hash: "ABC", validated: true, resultCode: "tesSUCCESS" };
       },
     });
+    const payload = settlePayload("2500000");
     const requirements = settleRequirements("2500000");
-    expect((await facilitator.settle(makePayload(), requirements)).success).toBe(false);
+    expect((await facilitator.settle(payload, requirements)).success).toBe(false);
 
     shouldThrow = false;
-    const retry = await facilitator.settle(makePayload(), requirements);
+    const retry = await facilitator.settle(payload, requirements);
     expect(retry.errorReason).toBe("duplicate_settlement");
   });
 
@@ -1352,19 +1377,20 @@ describe("UptoXrplScheme facilitator settlement dedup", () => {
     vi.useFakeTimers();
     try {
       const facilitator = createFacilitator();
-      const requirements = settleRequirements(
+      const payload = settlePayload(
         "2500000",
         signSettlement("2500000", { LastLedgerSequence: CURRENT_LEDGER + 30 }),
       );
-      expect((await facilitator.settle(makePayload(), requirements)).success).toBe(true);
+      const requirements = settleRequirements("2500000");
+      expect((await facilitator.settle(payload, requirements)).success).toBe(true);
 
       vi.advanceTimersByTime(200_000);
-      const duringWindow = await facilitator.settle(makePayload(), requirements);
+      const duringWindow = await facilitator.settle(payload, requirements);
       expect(duringWindow.errorReason).toBe("duplicate_settlement");
 
       // Past the claim's horizon the entry has no claim left to protect.
       vi.advanceTimersByTime(221_000);
-      const afterWindow = await facilitator.settle(makePayload(), requirements);
+      const afterWindow = await facilitator.settle(payload, requirements);
       expect(afterWindow.errorReason).not.toBe("duplicate_settlement");
     } finally {
       vi.useRealTimers();
@@ -1389,30 +1415,34 @@ describe("UptoXrplScheme facilitator settlement dedup", () => {
 
   it("does not let channel id casing split the dedup key", async () => {
     const facilitator = createFacilitator();
-    expect((await facilitator.settle(makePayload(), settleRequirements("2500000"))).success).toBe(
-      true,
-    );
+    expect(
+      (await facilitator.settle(settlePayload("2500000"), settleRequirements("2500000"))).success,
+    ).toBe(true);
 
     const lowercased = CHANNEL.toLowerCase();
     const result = await facilitator.settle(
-      makePayload({ channelId: lowercased }),
-      settleRequirements("2500000", signSettlement("2500000", { Channel: lowercased })),
+      settlePayload("2500000", signSettlement("2500000", { Channel: lowercased }), {
+        channelId: lowercased,
+      }),
+      settleRequirements("2500000"),
     );
     expect(result.errorReason).toBe("duplicate_settlement");
   });
 
   it("does not block the same channel id across networks", async () => {
     const facilitator = createFacilitator();
-    const testnet = await facilitator.settle(makePayload(), settleRequirements("2500000"));
+    const testnet = await facilitator.settle(
+      settlePayload("2500000"),
+      settleRequirements("2500000"),
+    );
     expect(testnet.success).toBe(true);
 
-    const mainnetRequirements = makeRequirements({
-      network: XRPL_MAINNET,
-      amount: "2500000",
-      extra: { settlementTransaction: signSettlement("2500000") },
-    });
+    const mainnetRequirements = makeRequirements({ network: XRPL_MAINNET, amount: "2500000" });
     const mainnetAccepted = makeRequirements({ network: XRPL_MAINNET });
-    const mainnet = await facilitator.settle(makePayload({}, mainnetAccepted), mainnetRequirements);
+    const mainnet = await facilitator.settle(
+      makePayload({ settlementTransaction: signSettlement("2500000") }, mainnetAccepted),
+      mainnetRequirements,
+    );
     expect(mainnet.success).toBe(true);
   });
 
@@ -1424,11 +1454,12 @@ describe("UptoXrplScheme facilitator settlement dedup", () => {
         return { hash: "ABC", validated: true, resultCode: "tesSUCCESS" };
       },
     });
+    const payload = settlePayload("2500000");
     const requirements = settleRequirements("2500000");
     const results = await Promise.all([
-      facilitator.settle(makePayload(), requirements),
-      facilitator.settle(makePayload(), requirements),
-      facilitator.settle(makePayload(), requirements),
+      facilitator.settle(payload, requirements),
+      facilitator.settle(payload, requirements),
+      facilitator.settle(payload, requirements),
     ]);
     expect(results.filter(result => result.success)).toHaveLength(1);
     expect(submissions).toBe(1);
@@ -1478,18 +1509,6 @@ describe("UptoXrplScheme server", () => {
     expect(enhanced.extra?.areFeesSponsored).toBe(false);
   });
 
-  it("refuses a challenge that already carries a settlement transaction", () => {
-    // Spec: extra.settlementTransaction MUST be absent from PAYMENT-REQUIRED,
-    // and the resource server is the party that emits that header.
-    expect(() =>
-      createServer().enhancePaymentRequirements(
-        makeRequirements({ extra: { settlementTransaction: signSettlement("1") } }),
-        supportedKind,
-        [],
-      ),
-    ).toThrow("absent from PAYMENT-REQUIRED");
-  });
-
   it("rejects a malformed minSettleDelay when enhancing requirements", () => {
     expect(() =>
       createServer().enhancePaymentRequirements(
@@ -1501,11 +1520,11 @@ describe("UptoXrplScheme server", () => {
   });
 
   it("signs a settlement claim carrying the payment's bindings", async () => {
-    const settleReqs = await createServer().buildSettlementRequirements(
-      makePayload(),
-      makeRequirements({ amount: "2470000" }),
+    const enrichment = await createServer().enrichSettlementPayload(
+      settleContext(makePayload(), makeRequirements({ amount: "2470000" })),
     );
-    const blob = settleReqs.extra?.settlementTransaction as string;
+    expect(Object.keys(enrichment ?? {})).toEqual(["settlementTransaction"]);
+    const blob = (enrichment as Record<string, unknown>).settlementTransaction as string;
     const claim = decode(blob) as unknown as PaymentChannelClaim;
     expect(claim.TransactionType).toBe("PaymentChannelClaim");
     expect(claim.Account).toBe(payTo);
@@ -1518,16 +1537,21 @@ describe("UptoXrplScheme server", () => {
     expect((claim.Flags as number) & PaymentChannelClaimFlags.tfRenew).toBe(0);
     expect(claim.NetworkID).toBeUndefined();
     expect(verifySignature(blob)).toBe(true);
-    expect(settleReqs.amount).toBe("2470000");
+  });
+
+  it("does not sign outside the settle phase", async () => {
+    const enrichment = await createServer().enrichSettlementPayload(
+      settleContext(makePayload(), makeRequirements({ amount: "2470000" }), "cancel"),
+    );
+    expect(enrichment).toBeUndefined();
   });
 
   it("signs a zero settlement as a bare close", async () => {
-    const settleReqs = await createServer().buildSettlementRequirements(
-      makePayload(),
-      makeRequirements({ amount: "0" }),
+    const enrichment = await createServer().enrichSettlementPayload(
+      settleContext(makePayload(), makeRequirements({ amount: "0" })),
     );
     const claim = decode(
-      settleReqs.extra?.settlementTransaction as string,
+      (enrichment as Record<string, unknown>).settlementTransaction as string,
     ) as unknown as PaymentChannelClaim;
     expect(claim.Balance).toBeUndefined();
     expect(claim.Amount).toBeUndefined();
@@ -1538,27 +1562,24 @@ describe("UptoXrplScheme server", () => {
 
   it("refuses to sign above the authorized maximum", async () => {
     await expect(
-      createServer().buildSettlementRequirements(
-        makePayload(),
-        makeRequirements({ amount: "10000001" }),
+      createServer().enrichSettlementPayload(
+        settleContext(makePayload(), makeRequirements({ amount: "10000001" })),
       ),
     ).rejects.toThrow("authorized maximum");
   });
 
   it("refuses a non-canonical settlement amount", async () => {
     await expect(
-      createServer().buildSettlementRequirements(
-        makePayload(),
-        makeRequirements({ amount: "02470000" }),
+      createServer().enrichSettlementPayload(
+        settleContext(makePayload(), makeRequirements({ amount: "02470000" })),
       ),
     ).rejects.toThrow("canonical");
   });
 
   it("refuses a malformed payment payload", async () => {
     await expect(
-      createServer().buildSettlementRequirements(
-        makePayload({ channelId: "abc" }),
-        makeRequirements({ amount: "2470000" }),
+      createServer().enrichSettlementPayload(
+        settleContext(makePayload({ channelId: "abc" }), makeRequirements({ amount: "2470000" })),
       ),
     ).rejects.toThrow("malformed");
   });
@@ -1573,7 +1594,9 @@ describe("UptoXrplScheme server", () => {
       }),
     });
     await expect(
-      server.buildSettlementRequirements(makePayload(), makeRequirements({ amount: "2470000" })),
+      server.enrichSettlementPayload(
+        settleContext(makePayload(), makeRequirements({ amount: "2470000" })),
+      ),
     ).rejects.toThrow("LastLedgerSequence");
   });
 });
@@ -1773,18 +1796,22 @@ describe("upto XRPL end to end", () => {
     const verified = await facilitator.verify(paymentPayload, baseRequirements);
     expect(verified.isValid).toBe(true);
 
-    const settleReqs = await serverScheme.buildSettlementRequirements(
-      paymentPayload,
-      makeRequirements({ amount: "2470000" }),
+    const settleReqs = makeRequirements({ amount: "2470000" });
+    const enrichment = await serverScheme.enrichSettlementPayload(
+      settleContext(paymentPayload, settleReqs),
     );
-    const settled = await facilitator.settle(paymentPayload, settleReqs);
+    const settlePaymentPayload = {
+      ...paymentPayload,
+      payload: { ...(paymentPayload.payload as Record<string, unknown>), ...enrichment },
+    } as unknown as PaymentPayload;
+    const settled = await facilitator.settle(settlePaymentPayload, settleReqs);
     expect(settled.success).toBe(true);
     expect(settled.transaction).toBe("CLAIM");
     expect(settled.amount).toBe("2470000");
     expect(settled.payer).toBe(payerWallet.classicAddress);
 
     // The close consumed the channel, so a repeat settlement finds nothing.
-    const duplicate = await facilitator.settle(paymentPayload, settleReqs);
+    const duplicate = await facilitator.settle(settlePaymentPayload, settleReqs);
     expect(duplicate.success).toBe(false);
     expect(duplicate.errorReason).toBe("invalid_upto_xrpl_channel_not_found");
   });

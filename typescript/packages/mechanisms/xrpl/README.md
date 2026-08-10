@@ -186,16 +186,15 @@ const payToWallet = Wallet.fromSeed(process.env.XRPL_PAYTO_SEED!);
 const server = new UptoXrplScheme(createXrplWalletSigner(payToWallet));
 ```
 
-The signer must be authorized for the `payTo` account: its master key pair (unless disabled) or its configured regular key. After verification and the metered work, build the settle-time requirements with the actual charge and pass them to the facilitator's `/settle`:
+The signer must be authorized for the `payTo` account: its master key pair (unless disabled) or its configured regular key. After verification and the metered work, settle through the resource server with the actual charge as a settlement override:
 
 ```typescript
-const settleRequirements = await server.buildSettlementRequirements(paymentPayload, {
-  ...requirements,
+const settled = await resourceServer.settlePayment(paymentPayload, requirements, undefined, undefined, {
   amount: actualDrops, // the measured charge; "0" refunds the deposit in full
 });
 ```
 
-`buildSettlementRequirements` signs the `PaymentChannelClaim` that closes the channel and places the blob in `extra.settlementTransaction`. That field is settle-time only; `enhancePaymentRequirements` refuses requirements that already carry one, so it can never appear in a `PAYMENT-REQUIRED` challenge.
+Core applies the override and invokes the scheme's `enrichSettlementPayload` hook, which signs the `PaymentChannelClaim` that closes the channel and adds the blob to the payment payload as `settlementTransaction` before the facilitator's `/settle`. That field is server-owned and settle-time only; verification rejects a payload that already carries one, so a client can never smuggle its own claim in.
 
 ### Facilitator
 
