@@ -1,5 +1,5 @@
-import type { SubmittableTransaction, Wallet } from "xrpl";
-import type { ClientXrplSigner } from "./types";
+import { authorizeChannel, type SubmittableTransaction, type Wallet } from "xrpl";
+import type { ClientXrplSigner, UptoClientXrplSigner } from "./types";
 
 /**
  * Creates a client signer adapter from an xrpl.js Wallet.
@@ -17,5 +17,20 @@ export function createXrplWalletSigner(wallet: Wallet): ClientXrplSigner {
         hash: signed.hash,
       };
     },
+  };
+}
+
+/**
+ * Creates an upto client signer adapter from an xrpl.js Wallet.
+ *
+ * @param wallet - XRPL wallet
+ * @returns x402 XRPL upto client signer
+ */
+export function createUptoXrplWalletSigner(wallet: Wallet): UptoClientXrplSigner {
+  return {
+    ...createXrplWalletSigner(wallet),
+    publicKey: wallet.publicKey,
+    signClaim: (channelId: string, amountDrops: string) =>
+      authorizeChannel(wallet, channelId, amountDrops),
   };
 }

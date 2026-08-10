@@ -4,3 +4,4 @@ export * from "./utils";
 export * from "./signer";
 export * from "./settlement-cache";
 export * from "./exact";
+export * from "./upto";

@@ -7,9 +7,9 @@ import { SETTLEMENT_TTL_MS } from "./constants";
  * `submitAndWait` for an already-submitted hash resolves with the same
  * `tesSUCCESS` outcome instead of failing, so every concurrent `/settle`
  * call carrying the same signed blob would otherwise report success.
- * Because Node.js is single-threaded, no lock is required — the cache
- * check + insert must simply occur before the first `await` in the
- * settle path.
+ * Because Node.js is single-threaded and the check + insert happens
+ * synchronously inside one call, concurrent settle paths cannot
+ * interleave within it and no lock is required.
  *
  * Unlike Solana, whose blockhash lifetime bounds the replay window at a
  * protocol-fixed ~60-90s, an XRPL transaction stays landable until its
@@ -25,8 +25,9 @@ import { SETTLEMENT_TTL_MS } from "./constants";
  * store so duplicates routed to different replicas are still caught.
  */
 export class SettlementCache {
-  /** Maps a settlement key to the absolute time (ms epoch) it may be evicted. */
-  private readonly entries = new Map<string, number>();
+  /** Maps a settlement key to its holder's token and eviction time (ms epoch). */
+  private readonly entries = new Map<string, { token: number; expiresAt: number }>();
+  private nextToken = 1;
 
   /**
    * Returns `true` if `key` is already pending settlement (duplicate),
@@ -40,12 +41,47 @@ export class SettlementCache {
    * @returns `true` if the key was already present (duplicate); `false` otherwise.
    */
   isDuplicate(key: string, ttlMs: number = SETTLEMENT_TTL_MS): boolean {
+    return this.acquire(key, ttlMs) === undefined;
+  }
+
+  /**
+   * Claims `key` for one settlement attempt.
+   *
+   * @param key - The unique identifier for the settlement.
+   * @param ttlMs - How long to retain the entry, in milliseconds; must cover the
+   *   transaction's landable window. Defaults to {@link SETTLEMENT_TTL_MS}.
+   * @returns A token identifying this holder, or undefined when the key is held.
+   */
+  acquire(key: string, ttlMs: number = SETTLEMENT_TTL_MS): number | undefined {
     this.prune();
     if (this.entries.has(key)) {
-      return true;
+      return undefined;
     }
-    this.entries.set(key, Date.now() + ttlMs);
-    return false;
+    const token = this.nextToken++;
+    this.entries.set(key, { token, expiresAt: Date.now() + ttlMs });
+    return token;
+  }
+
+  /**
+   * Releases a key claimed by {@link acquire}, re-allowing settlement.
+   *
+   * For a settlement whose submission definitively failed (a final result in
+   * a validated ledger), retaining the entry would block every retry for the
+   * full TTL while nothing ever landed. Callers release on definitive failure
+   * and retain on success or on an ambiguous outcome (an exception
+   * mid-submission may still land).
+   *
+   * The token makes the release the holder's own: if the entry has since been
+   * evicted and re-claimed by another attempt, releasing must not cancel that
+   * attempt's protection while its transaction may still be in flight.
+   *
+   * @param key - The unique identifier previously passed to {@link acquire}.
+   * @param token - The token that {@link acquire} returned to this holder.
+   */
+  release(key: string, token: number): void {
+    if (this.entries.get(key)?.token === token) {
+      this.entries.delete(key);
+    }
   }
 
   /**
@@ -56,8 +92,8 @@ export class SettlementCache {
    */
   private prune(): void {
     const now = Date.now();
-    for (const [key, expiresAt] of this.entries) {
-      if (expiresAt <= now) {
+    for (const [key, entry] of this.entries) {
+      if (entry.expiresAt <= now) {
         this.entries.delete(key);
       }
     }

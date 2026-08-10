@@ -54,6 +54,37 @@ export const DEFAULT_LEDGER_TOLERANCE = 2;
 export const TF_PARTIAL_PAYMENT = 0x00020000;
 
 /**
+ * Seconds between the Unix epoch and the Ripple epoch (2000-01-01T00:00:00Z).
+ */
+export const RIPPLE_EPOCH_OFFSET = 946_684_800;
+
+/**
+ * Ledgers xrpl.js `autofill` adds when it sets `LastLedgerSequence`.
+ *
+ * A settlement transaction is built by the resource server, which reaches for
+ * `autofill` by default, so a bound below this would reject an honestly-built
+ * claim for every short `maxTimeoutSeconds`.
+ */
+export const XRPL_AUTOFILL_LEDGER_OFFSET = 20;
+
+/**
+ * Pessimistic XRPL ledger close interval, in seconds.
+ *
+ * Ledgers close in roughly 3-5 seconds, but a duration derived from a ledger
+ * count must assume the slow end: a retention window sized from the optimistic
+ * rate would expire while its transaction could still land.
+ */
+export const MAX_LEDGER_CLOSE_SECONDS = 10;
+
+/**
+ * Seconds a channel must outlive the present for a claim to land in it.
+ *
+ * Sized at the ledger tolerance the package already applies to submission,
+ * priced at the pessimistic close rate.
+ */
+export const LANDING_MARGIN_SECONDS = DEFAULT_LEDGER_TOLERANCE * MAX_LEDGER_CLOSE_SECONDS;
+
+/**
  * XRPL AccountRoot lsfDisableMaster flag: the account's master key pair is disabled.
  */
 export const LSF_DISABLE_MASTER = 0x00100000;

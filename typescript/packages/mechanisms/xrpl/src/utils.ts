@@ -15,6 +15,9 @@ import {
   LSF_DISABLE_MASTER,
   MAX_ACCOUNT_TICKETS,
   MAX_DESTINATION_TAG,
+  MAX_LEDGER_CLOSE_SECONDS,
+  SETTLEMENT_TTL_MS,
+  XRPL_AUTOFILL_LEDGER_OFFSET,
   XRPL_DEVNET,
   XRPL_DEVNET_WS_URL,
   XRPL_MAINNET,
@@ -25,6 +28,8 @@ import {
 import type {
   ClientXrplSigner,
   ExactXrplPayload,
+  PayChannelEntry,
+  UptoXrplPayload,
   XrplAccountAuthorization,
   XrplAssetTransferMethod,
   XrplClientFactory,
@@ -159,7 +164,9 @@ export function invoiceIdToInvoiceIdField(invoiceId: string): string {
  * @returns Decoded transaction
  */
 export function decodeSignedTransactionBlob(signedTxBlob: string): Transaction {
-  if (!/^[A-Fa-f0-9]+$/.test(signedTxBlob)) {
+  // An odd-length blob decodes fine — the trailing nibble is dropped — so the
+  // bytes that were validated would not be the bytes submitted.
+  if (!/^[A-Fa-f0-9]+$/.test(signedTxBlob) || signedTxBlob.length % 2 !== 0) {
     throw new Error("signedTxBlob must be hex");
   }
   return decode(signedTxBlob) as Transaction;
@@ -176,6 +183,34 @@ export function getExactXrplPayload(payload: PaymentPayload): ExactXrplPayload {
     throw new Error("XRPL exact payload requires signedTxBlob");
   }
   return payload.payload as ExactXrplPayload;
+}
+
+/**
+ * Pattern for a PayChannel ledger object index.
+ */
+const CHANNEL_ID_PATTERN = /^[0-9A-F]{64}$/i;
+
+/**
+ * Narrows an unknown payload to the XRPL upto payload shape.
+ *
+ * @param payload - x402 payment payload
+ * @returns The upto payload, or undefined when malformed
+ */
+export function getUptoXrplPayload(payload: PaymentPayload): UptoXrplPayload | undefined {
+  const candidate = payload.payload;
+  if (
+    !isRecord(candidate) ||
+    typeof candidate.channelId !== "string" ||
+    !CHANNEL_ID_PATTERN.test(candidate.channelId) ||
+    typeof candidate.maxAmount !== "string" ||
+    typeof candidate.signature !== "string" ||
+    typeof candidate.publicKey !== "string" ||
+    typeof candidate.payer !== "string" ||
+    !isValidClassicAddress(candidate.payer)
+  ) {
+    return undefined;
+  }
+  return candidate as unknown as UptoXrplPayload;
 }
 
 /**
@@ -197,6 +232,17 @@ export function isIntegerString(value: string): boolean {
  */
 export function isDecimalString(value: string): boolean {
   return /^\d+(\.\d+)?$/.test(value);
+}
+
+/**
+ * Parses a drops amount strictly, rejecting signs, fractions, exponents and
+ * whitespace that `BigInt()` alone would accept or throw on.
+ *
+ * @param value - Candidate drops amount
+ * @returns The parsed amount, or undefined when malformed or negative
+ */
+export function parseDrops(value: unknown): bigint | undefined {
+  return typeof value === "string" && isIntegerString(value) ? BigInt(value) : undefined;
 }
 
 /**
@@ -230,6 +276,61 @@ export function getMaxLastLedgerSequence(
     Math.ceil(requirements.maxTimeoutSeconds / DEFAULT_LEDGER_CLOSE_SECONDS) +
     DEFAULT_LEDGER_TOLERANCE
   );
+}
+
+/**
+ * Returns how long a settlement cache entry must be retained.
+ *
+ * A submitted transaction stays landable until its `LastLedgerSequence`, so
+ * the entry must outlive exactly that horizon, converted to wall-clock time
+ * at the pessimistic close rate (see MAX_LEDGER_CLOSE_SECONDS).
+ *
+ * @param currentLedgerIndex - Current validated ledger index
+ * @param lastLedgerSequence - The transaction's LastLedgerSequence
+ * @returns Retention window in milliseconds
+ */
+export function getSettlementTtlMs(currentLedgerIndex: number, lastLedgerSequence: number): number {
+  const ledgers = Math.max(0, lastLedgerSequence - currentLedgerIndex);
+  return ledgers * MAX_LEDGER_CLOSE_SECONDS * 1000 + SETTLEMENT_TTL_MS;
+}
+
+/**
+ * Builds the max allowed LastLedgerSequence for a facilitator-submitted
+ * settlement transaction.
+ *
+ * Unlike an `exact` payload, this transaction is built by the resource server
+ * at settle time, so the bound must admit the fixed autofill offset as well
+ * as the payment's own timeout (see XRPL_AUTOFILL_LEDGER_OFFSET).
+ *
+ * @param currentLedgerIndex - Current validated ledger index
+ * @param requirements - Payment requirements
+ * @returns Maximum allowed LastLedgerSequence
+ */
+export function getMaxSettlementLastLedgerSequence(
+  currentLedgerIndex: number,
+  requirements: PaymentRequirements,
+): number {
+  return (
+    currentLedgerIndex +
+    Math.max(
+      XRPL_AUTOFILL_LEDGER_OFFSET,
+      Math.ceil(requirements.maxTimeoutSeconds / DEFAULT_LEDGER_CLOSE_SECONDS),
+    ) +
+    DEFAULT_LEDGER_TOLERANCE
+  );
+}
+
+/**
+ * Checks whether a value is a non-negative integer number.
+ *
+ * `typeof value === "number"` alone admits NaN, which silently defeats every
+ * comparison it reaches.
+ *
+ * @param value - Value to inspect
+ * @returns Whether the value is a non-negative integer
+ */
+export function isNonNegativeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0;
 }
 
 /**
@@ -420,6 +521,96 @@ export async function getXrplAccountAuthorization(
 }
 
 /**
+ * Reads a `PayChannel` ledger object from a validated ledger.
+ *
+ * Returns undefined only when the entry does not exist; transport and node
+ * errors propagate so an infrastructure fault is not reported as a missing
+ * channel.
+ *
+ * @param channelId - Index of the PayChannel ledger object
+ * @param network - XRPL network id
+ * @param options - Facilitator options
+ * @returns The channel entry, or undefined when it does not exist
+ */
+export async function getPayChannel(
+  channelId: string,
+  network: Network,
+  options: Pick<XrplFacilitatorOptions, "getPayChannel" | "wsUrlByNetwork" | "clientFactory"> = {},
+): Promise<PayChannelEntry | undefined> {
+  if (options.getPayChannel) {
+    return options.getPayChannel(channelId, network);
+  }
+
+  const client = createXrplClient(network, options);
+  try {
+    await client.connect();
+    const response = await client.request({
+      command: "ledger_entry",
+      index: channelId,
+      ledger_index: "validated",
+    });
+    const node = response.result.node as unknown as Partial<PayChannelEntry> | undefined;
+    if (
+      !node ||
+      node.LedgerEntryType !== "PayChannel" ||
+      typeof node.Account !== "string" ||
+      typeof node.Destination !== "string" ||
+      typeof node.Amount !== "string" ||
+      typeof node.Balance !== "string" ||
+      typeof node.PublicKey !== "string" ||
+      typeof node.SettleDelay !== "number"
+    ) {
+      return undefined;
+    }
+    return node as PayChannelEntry;
+  } catch (error) {
+    if (isRecord(error) && isRecord(error.data) && error.data.error === "entryNotFound") {
+      return undefined;
+    }
+    throw error;
+  } finally {
+    await client.disconnect();
+  }
+}
+
+/**
+ * Reads the close time of the latest validated ledger, in Ripple-epoch
+ * seconds.
+ *
+ * The channel's `CancelAfter` is expressed on the ledger's clock, so expiry
+ * is compared against the ledger's own close time rather than the
+ * facilitator's wall clock.
+ *
+ * @param network - XRPL network id
+ * @param options - Facilitator options
+ * @returns Ledger close time in Ripple-epoch seconds
+ */
+export async function getLedgerCloseTime(
+  network: Network,
+  options: Pick<
+    XrplFacilitatorOptions,
+    "getLedgerCloseTime" | "wsUrlByNetwork" | "clientFactory"
+  > = {},
+): Promise<number> {
+  if (options.getLedgerCloseTime) {
+    return options.getLedgerCloseTime(network);
+  }
+
+  const client = createXrplClient(network, options);
+  try {
+    await client.connect();
+    const response = await client.request({ command: "ledger", ledger_index: "validated" });
+    const closeTime = (response.result.ledger as { close_time?: number }).close_time;
+    if (typeof closeTime !== "number") {
+      throw new Error("validated ledger has no close_time");
+    }
+    return closeTime;
+  } finally {
+    await client.disconnect();
+  }
+}
+
+/**
  * Lists the available ticket sequences for an XRPL account.
  *
  * @param account - XRPL classic address
@@ -558,14 +749,15 @@ export async function submitSignedTransaction(
       autofill: false,
       failHard: true,
     });
-    const resultCode =
+    const meta =
       typeof response.result.meta === "object" && response.result.meta !== null
-        ? response.result.meta.TransactionResult
-        : "unknown";
+        ? response.result.meta
+        : undefined;
     return {
       hash: response.result.hash ?? getSignedTransactionHash(signedTxBlob),
       validated: response.result.validated === true,
-      resultCode,
+      resultCode: meta?.TransactionResult ?? "unknown",
+      meta,
     };
   } finally {
     await client.disconnect();

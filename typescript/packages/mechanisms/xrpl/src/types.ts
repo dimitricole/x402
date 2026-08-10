@@ -1,4 +1,11 @@
-import type { Client, Payment, SubmittableTransaction } from "xrpl";
+import type {
+  Client,
+  Payment,
+  PaymentChannelClaim,
+  PaymentChannelCreate,
+  SubmittableTransaction,
+  TransactionMetadata,
+} from "xrpl";
 import type { Network, PaymentRequirements } from "@x402/core/types";
 
 /**
@@ -55,6 +62,73 @@ export type XrplPaymentRequirementsExtra = {
 };
 
 /**
+ * XRPL upto scheme payload.
+ */
+export type UptoXrplPayload = {
+  /**
+   * Index of the `PayChannel` ledger object.
+   */
+  channelId: string;
+  /**
+   * Drops authorized by `signature`. Must equal the amount the payer signed.
+   */
+  maxAmount: string;
+  /**
+   * Payer's off-ledger claim signature over `(channelId, maxAmount)`.
+   */
+  signature: string;
+  /**
+   * Channel `PublicKey`. The ledger verifies the claim against it.
+   */
+  publicKey: string;
+  /**
+   * Channel `Account`, i.e. the payer's classic address.
+   */
+  payer: string;
+};
+
+/**
+ * Extra payment requirements for XRPL upto payments.
+ */
+export type UptoXrplPaymentRequirementsExtra = {
+  /**
+   * Always false: the payer funds the channel and pays its creation fee.
+   */
+  areFeesSponsored: boolean;
+  /**
+   * Minimum `SettleDelay` the channel must carry, in seconds. Prevents a payer
+   * from stranding settlement by racing a source-initiated close.
+   */
+  minSettleDelay?: number;
+  /**
+   * Earliest activation time in Unix seconds, enforced at verification
+   * against the validated ledger's close time.
+   */
+  validAfter?: number;
+  /**
+   * Settle-time only: hex blob of the `PaymentChannelClaim` signed by the
+   * `payTo` account, which the facilitator verifies and submits.
+   */
+  settlementTransaction?: string;
+};
+
+/**
+ * Fields of a `PayChannel` ledger object relevant to the upto scheme.
+ */
+export type PayChannelEntry = {
+  LedgerEntryType: "PayChannel";
+  Account: string;
+  Destination: string;
+  Amount: string;
+  /** Total delivered so far. "0" on an unspent channel. */
+  Balance: string;
+  PublicKey: string;
+  SettleDelay: number;
+  CancelAfter?: number;
+  Expiration?: number;
+};
+
+/**
  * Client signer abstraction for XRPL transactions.
  */
 export type ClientXrplSigner = {
@@ -68,6 +142,84 @@ export type ClientXrplSigner = {
   sign(
     transaction: SubmittableTransaction,
   ): Promise<{ signedTxBlob: string; hash?: string }> | { signedTxBlob: string; hash?: string };
+};
+
+/**
+ * Client signer for XRPL upto payments.
+ *
+ * The channel is created with `publicKey` and the off-ledger claim must
+ * verify against it, so both key operations must come from one key pair.
+ */
+export type UptoClientXrplSigner = ClientXrplSigner & {
+  /**
+   * Hex public key placed on the channel as `PublicKey`.
+   */
+  publicKey: string;
+  /**
+   * Signs the off-ledger claim over `(channelId, amount)`, amount in drops.
+   */
+  signClaim(channelId: string, amountDrops: string): Promise<string> | string;
+};
+
+/**
+ * Options for XRPL upto client payment creation.
+ */
+export type UptoXrplClientOptions = {
+  /**
+   * Optional fee to place on the channel-create transaction, in drops.
+   */
+  feeDrops?: string;
+  /**
+   * Optional function used to read the validated ledger's close time, in
+   * Ripple-epoch seconds. The channel's CancelAfter derives from it.
+   */
+  getLedgerCloseTime?: (network: Network) => Promise<number>;
+  /**
+   * Optional function to prepare/autofill the channel-create transaction
+   * before signing.
+   */
+  prepareChannelCreateTransaction?: (
+    transaction: PaymentChannelCreate,
+    requirements: PaymentRequirements,
+  ) => Promise<PaymentChannelCreate>;
+  /**
+   * Optional custom submission function for tests or custom infrastructure.
+   */
+  submitSignedTransaction?: (
+    signedTxBlob: string,
+    network: Network,
+  ) => Promise<XrplSettlementResult>;
+  /**
+   * Optional WebSocket endpoint map by x402 network id.
+   */
+  wsUrlByNetwork?: Partial<Record<XrplNetwork, string>>;
+  /**
+   * Optional XRPL client factory.
+   */
+  clientFactory?: XrplClientFactory;
+};
+
+/**
+ * Options for XRPL upto server settlement building.
+ */
+export type UptoXrplServerOptions = {
+  /**
+   * Optional function to prepare/autofill the settlement claim before
+   * signing. Defaults to xrpl.js autofill, which sets `Sequence`, `Fee` and
+   * `LastLedgerSequence`.
+   */
+  prepareSettlementTransaction?: (
+    transaction: PaymentChannelClaim,
+    requirements: PaymentRequirements,
+  ) => Promise<PaymentChannelClaim>;
+  /**
+   * Optional WebSocket endpoint map by x402 network id.
+   */
+  wsUrlByNetwork?: Partial<Record<XrplNetwork, string>>;
+  /**
+   * Optional XRPL client factory.
+   */
+  clientFactory?: XrplClientFactory;
 };
 
 /**
@@ -126,6 +278,11 @@ export type XrplSettlementResult = {
    * XRPL transaction result code.
    */
   resultCode: string;
+  /**
+   * Validated transaction metadata, when the submission path provides it.
+   * The upto scheme uses it to confirm the delivered amount.
+   */
+  meta?: TransactionMetadata;
 };
 
 /**
@@ -196,6 +353,17 @@ export type XrplFacilitatorOptions = {
     ticketSequence: number,
     network: Network,
   ) => Promise<boolean>;
+  /**
+   * Optional function used to read a `PayChannel` ledger object. Defaults to
+   * a validated ledger_entry lookup. Returns undefined when the entry does
+   * not exist.
+   */
+  getPayChannel?: (channelId: string, network: Network) => Promise<PayChannelEntry | undefined>;
+  /**
+   * Optional function used to read the validated ledger's close time, in
+   * Ripple-epoch seconds. Defaults to a validated ledger lookup.
+   */
+  getLedgerCloseTime?: (network: Network) => Promise<number>;
   /**
    * Optional custom submission function for tests or custom infrastructure.
    */
