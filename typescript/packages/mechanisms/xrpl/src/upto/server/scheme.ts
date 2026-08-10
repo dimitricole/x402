@@ -3,6 +3,7 @@ import type {
   Money,
   MoneyParser,
   Network,
+  PaymentFlowConfig,
   PaymentPayload,
   PaymentRequirements,
   Price,
@@ -34,6 +35,12 @@ import type { ClientXrplSigner, UptoXrplPayload, UptoXrplServerOptions } from ".
  */
 export class UptoXrplScheme implements SchemeNetworkServer {
   readonly scheme = "upto";
+  // No on-wire assetTransferMethod: the client opens the channel itself and
+  // verification is read-only, so verify runs before the handler and settle after.
+  readonly defaultAssetTransferMethod = "default";
+  readonly paymentFlows = {
+    default: { supported: ["authorization"], default: "authorization" },
+  } as const satisfies Record<string, PaymentFlowConfig>;
   private moneyParsers: MoneyParser[] = [];
 
   /**
