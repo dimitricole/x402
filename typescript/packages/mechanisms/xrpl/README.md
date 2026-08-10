@@ -155,9 +155,9 @@ Verification enforces the spec's checks: envelope consistency, offline signature
 
 ## Upto Scheme
 
-`upto` authorizes a transfer of up to a maximum amount; the actual charge is determined at settlement from measured consumption. XRPL realizes it with [Payment Channels](https://xrpl.org/docs/concepts/payment-types/payment-channels): the payer escrows the ceiling in a channel and signs one off-ledger claim over `(channelId, maxAmount)`, and the resource server later claims the actual amount and closes the channel, refunding the remainder. XRP only — Payment Channels cannot carry issued currencies.
+`upto` authorizes a transfer of up to a maximum amount; the actual charge is determined at settlement from measured consumption. XRPL realizes it with [Payment Channels](https://xrpl.org/docs/concepts/payment-types/payment-channels): the payer escrows the ceiling in a channel and signs one off-ledger claim over `(channelId, maxAmount)`, and the resource server later claims the actual amount and closes the channel, refunding the remainder. XRP only; Payment Channels cannot carry issued currencies.
 
-The facilitator holds no key and pays no fee. Closing a channel atomically requires the transaction to originate from the channel `Destination`, so the resource server — the party that knows the actual charge — signs the settlement `PaymentChannelClaim`, and the facilitator verifies and relays it.
+The facilitator holds no key and pays no fee. Closing a channel atomically requires the transaction to originate from the channel `Destination`, so the resource server, the party that knows the actual charge, signs the settlement `PaymentChannelClaim`, and the facilitator verifies and relays it.
 
 ### Client
 
@@ -205,9 +205,9 @@ import { UptoXrplScheme } from "@x402/xrpl/upto/facilitator";
 const facilitator = new x402Facilitator().register("xrpl:*", new UptoXrplScheme());
 ```
 
-Verification reads the `PayChannel` from a validated ledger and enforces the spec's checks: envelope consistency, channel bindings (destination, payer, public key), the payer's claim signature over `(channelId, maxAmount)`, single use (`Balance` is `0`), and time bounds with a landing margin so an admitted payment is still settleable once the metered work has run. Settlement re-verifies against the authorized maximum, checks the server-signed claim's bindings and signer authorization, submits it, and succeeds only on a validated `tesSUCCESS`; when the submission path returns transaction metadata, the delivered amount is confirmed from it, because a claim landing on an expired channel closes it without delivering and still returns `tesSUCCESS`.
+Verification reads the `PayChannel` from a validated ledger and enforces the spec's checks: envelope consistency, channel bindings (destination, payer, public key), the payer's claim signature over `(channelId, maxAmount)`, single use (`Balance` is `0`), and time bounds with a landing margin so an admitted payment is still settleable once the metered work has run. Settlement re-verifies against the authorized maximum, checks the server-signed claim's bindings and signer authorization, submits it, and succeeds only on a validated `tesSUCCESS`; when the submission path returns transaction metadata, the delivered amount is confirmed from it, because a claim landing on an expired channel closes it without delivering and still returns `tesSUCCESS`. A zero settlement, or a nonzero charge the channel's `Balance` already covers (the source can deliver drops unilaterally at any time), cannot be expressed as a claim and settles as a bare destination close, refunding the undrawn remainder; the settle-time validated `Balance` read is the payment evidence for that form.
 
-Upto settlements are deduplicated on `(network, channelId)` — the channel can be drawn only once — using the same `SettlementCache` described below, and the entry is released when submission returns a validated non-`tesSUCCESS` result, since a per-settlement server-signed claim cannot double-pay the way a replayed exact blob can.
+Upto settlements are deduplicated on `(network, channelId)`, since the channel can be drawn only once, using the same `SettlementCache` described below, and the entry is released when submission returns a validated non-`tesSUCCESS` result, since a per-settlement server-signed claim cannot double-pay the way a replayed exact blob can.
 
 For protocol details, see [`scheme_upto_xrpl.md`](../../../../specs/schemes/upto/scheme_upto_xrpl.md).
 

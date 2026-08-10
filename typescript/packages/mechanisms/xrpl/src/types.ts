@@ -215,6 +215,13 @@ export type UptoXrplServerOptions = {
     requirements: PaymentRequirements,
   ) => Promise<PaymentChannelClaim>;
   /**
+   * Optional function used to read a `PayChannel` ledger object, from which
+   * settlement decides between a claim and a bare close. Defaults to a
+   * validated ledger_entry lookup. Returns undefined when the entry does not
+   * exist.
+   */
+  getPayChannel?: (channelId: string, network: Network) => Promise<PayChannelEntry | undefined>;
+  /**
    * Optional WebSocket endpoint map by x402 network id.
    */
   wsUrlByNetwork?: Partial<Record<XrplNetwork, string>>;

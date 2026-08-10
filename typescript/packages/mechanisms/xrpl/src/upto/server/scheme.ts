@@ -15,6 +15,7 @@ import { parseMoneyString } from "@x402/core/utils";
 import { PaymentChannelClaimFlags, type PaymentChannelClaim } from "xrpl";
 import {
   createXrplClient,
+  getPayChannel,
   getUptoXrplPayload,
   isIntegerString,
   isNonNegativeInteger,
@@ -179,7 +180,28 @@ export class UptoXrplScheme implements SchemeNetworkServer {
       throw new Error("XRPL upto settlement amount exceeds the authorized maximum");
     }
 
-    const claim = this.buildSettlementTransaction(uptoPayload, requirements, settleAmount);
+    // The source can raise the channel's Balance unilaterally at any time. A
+    // charge the channel has already delivered cannot be expressed as a claim
+    // (the ledger requires a claim's Balance to exceed the delivered total),
+    // so like a zero charge it settles as a bare destination close.
+    let bareClose = settleAmount === 0n;
+    if (!bareClose) {
+      const channel = await getPayChannel(
+        uptoPayload.channelId,
+        requirements.network,
+        this.options,
+      );
+      if (!channel) {
+        throw new Error("XRPL upto settlement channel not found");
+      }
+      const delivered = parseDrops(channel.Balance);
+      if (delivered === undefined) {
+        throw new Error("XRPL upto settlement channel Balance is malformed");
+      }
+      bareClose = delivered >= settleAmount;
+    }
+
+    const claim = this.buildSettlementTransaction(uptoPayload, requirements, bareClose);
     const prepared = await this.prepareSettlementTransaction(claim, requirements);
     this.validatePreparedSettlementTransaction(prepared, requirements.network);
     const signed = await this.signer.sign(prepared);
@@ -191,19 +213,20 @@ export class UptoXrplScheme implements SchemeNetworkServer {
    * Builds the unsigned settlement claim per the scheme's binding rules.
    *
    * `Amount` carries the authorized maximum the payer signed over, never the
-   * settlement amount, and `Balance` the actual charge. A zero settlement is
-   * a bare destination close: the ledger requires a claim's `Balance` to
-   * exceed the delivered total, so zero cannot be expressed as a claim.
+   * settlement amount, and `Balance` the actual charge. A zero settlement, or
+   * a nonzero charge the channel has already delivered, is a bare destination
+   * close: the ledger requires a claim's `Balance` to exceed the delivered
+   * total, so neither can be expressed as a claim.
    *
    * @param uptoPayload - XRPL upto payload
    * @param requirements - Payment requirements with amount set to the actual charge
-   * @param settleAmount - Actual settlement amount in drops
+   * @param bareClose - Whether the settlement is a bare destination close
    * @returns Unsigned PaymentChannelClaim
    */
   private buildSettlementTransaction(
     uptoPayload: UptoXrplPayload,
     requirements: PaymentRequirements,
-    settleAmount: bigint,
+    bareClose: boolean,
   ): PaymentChannelClaim {
     const networkId = parseXrplNetworkId(requirements.network);
     return {
@@ -211,14 +234,14 @@ export class UptoXrplScheme implements SchemeNetworkServer {
       Account: requirements.payTo,
       Channel: uptoPayload.channelId,
       Flags: PaymentChannelClaimFlags.tfClose,
-      ...(settleAmount > 0n
-        ? {
+      ...(bareClose
+        ? {}
+        : {
             Balance: requirements.amount,
             Amount: uptoPayload.maxAmount,
             Signature: uptoPayload.signature,
             PublicKey: uptoPayload.publicKey,
-          }
-        : {}),
+          }),
       ...(networkId > 1024 ? { NetworkID: networkId } : {}),
     };
   }

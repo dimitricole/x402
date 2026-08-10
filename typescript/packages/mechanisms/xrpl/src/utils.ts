@@ -164,7 +164,7 @@ export function invoiceIdToInvoiceIdField(invoiceId: string): string {
  * @returns Decoded transaction
  */
 export function decodeSignedTransactionBlob(signedTxBlob: string): Transaction {
-  // An odd-length blob decodes fine — the trailing nibble is dropped — so the
+  // An odd-length blob decodes fine (the trailing nibble is dropped), so the
   // bytes that were validated would not be the bytes submitted.
   if (!/^[A-Fa-f0-9]+$/.test(signedTxBlob) || signedTxBlob.length % 2 !== 0) {
     throw new Error("signedTxBlob must be hex");

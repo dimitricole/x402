@@ -26,6 +26,7 @@ import type {
   PayChannelEntry,
   UptoXrplClientOptions,
   UptoXrplPayload,
+  UptoXrplServerOptions,
   XrplFacilitatorOptions,
 } from "../../src";
 import type { PaymentPayload, PaymentRequirements } from "@x402/core/types";
@@ -729,7 +730,7 @@ describe("UptoXrplScheme facilitator settle", () => {
 
   it("rejects a settlement without a settlement transaction", async () => {
     const result = await createFacilitator().settle(makePayload(), settleRequirements("2500000"));
-    expect(result.errorReason).toBe("invalid_upto_xrpl_payload_missing_settlement_transaction");
+    expect(result.errorReason).toBe("invalid_upto_xrpl_missing_settlement_transaction");
   });
 
   it("rejects a settlement above the authorized maximum", async () => {
@@ -1056,11 +1057,77 @@ describe("UptoXrplScheme facilitator settle", () => {
     expect(result.success).toBe(true);
   });
 
-  it("rejects a settlement the channel has already delivered", async () => {
+  it("settles a pre-delivered charge as a bare destination close", async () => {
+    // The source delivered the full charge unilaterally, so it cannot be
+    // expressed as a claim: settlement is a bare close, refunding only the
+    // undrawn remainder, and the response reports the settlement-time charge.
+    const result = await createFacilitator({
+      getPayChannel: async () => makeChannel({ Balance: "2500000" }),
+    }).settle(settlePayload("2500000", signSettlement("0")), settleRequirements("2500000"));
+    expect(result.success).toBe(true);
+    expect(result.transaction).toBe("ABC");
+    expect(result.amount).toBe("2500000");
+  });
+
+  it("settles a charge the channel over-delivered as a bare destination close", async () => {
+    const result = await createFacilitator({
+      getPayChannel: async () => makeChannel({ Balance: "3000000" }),
+    }).settle(settlePayload("2500000", signSettlement("0")), settleRequirements("2500000"));
+    expect(result.success).toBe(true);
+    expect(result.amount).toBe("2500000");
+  });
+
+  it("accepts claim metadata that over-covers the charge", async () => {
+    // The source can deliver drops between the settle-time read and the
+    // claim's validation; Balance is monotonic, so a final balance at or
+    // above the charge is payment in full, not a delivery failure.
+    const result = await createFacilitator({
+      getPayChannel: async () => makeChannel({ Balance: "1000000" }),
+      submitSignedTransaction: async () => ({
+        hash: "ABC",
+        validated: true,
+        resultCode: "tesSUCCESS",
+        meta: claimMeta("3000000"),
+      }),
+    }).settle(settlePayload("2500000"), settleRequirements("2500000"));
+    expect(result.success).toBe(true);
+    expect(result.amount).toBe("2500000");
+  });
+
+  it("rejects a claim-form blob for a charge the channel already delivered", async () => {
+    // The server built a claim against an older Balance, then the source
+    // delivered the charge before settlement: the claim can no longer be
+    // expressed on-ledger, so the form no longer matches the channel state.
     const result = await createFacilitator({
       getPayChannel: async () => makeChannel({ Balance: "2500000" }),
     }).settle(settlePayload("2500000"), settleRequirements("2500000"));
-    expect(result.errorReason).toBe("invalid_upto_xrpl_channel_already_drawn");
+    expect(result.errorReason).toBe("invalid_upto_xrpl_settlement_transaction_mismatch");
+    expect(result.errorMessage).toContain("bare close");
+  });
+
+  it("rejects a bare close for a charge the channel has not delivered", async () => {
+    const result = await createFacilitator({
+      getPayChannel: async () => makeChannel({ Balance: "1000000" }),
+    }).settle(settlePayload("2500000", signSettlement("0")), settleRequirements("2500000"));
+    expect(result.errorReason).toBe("invalid_upto_xrpl_settlement_transaction_mismatch");
+    expect(result.errorMessage).toContain("Balance");
+  });
+
+  it("does not demand delivery metadata for a pre-delivered bare close", async () => {
+    // The payment evidence for a bare close is the settle-time validated
+    // Balance read; the closing transaction itself delivers nothing, and the
+    // final Balance need not equal the charge.
+    const result = await createFacilitator({
+      getPayChannel: async () => makeChannel({ Balance: "3000000" }),
+      submitSignedTransaction: async () => ({
+        hash: "ABC",
+        validated: true,
+        resultCode: "tesSUCCESS",
+        meta: claimMeta("3000000"),
+      }),
+    }).settle(settlePayload("2500000", signSettlement("0")), settleRequirements("2500000"));
+    expect(result.success).toBe(true);
+    expect(result.amount).toBe("2500000");
   });
 
   it("settles a channel whose pending close has not yet taken effect", async () => {
@@ -1469,14 +1536,16 @@ describe("UptoXrplScheme facilitator settlement dedup", () => {
 describe("UptoXrplScheme server", () => {
   const supportedKind = { x402Version: 2, scheme: "upto", network: XRPL_TESTNET } as const;
 
-  function createServer(): UptoXrplServerScheme {
+  function createServer(overrides: UptoXrplServerOptions = {}): UptoXrplServerScheme {
     return new UptoXrplServerScheme(createXrplWalletSigner(payToWallet), {
+      getPayChannel: async () => makeChannel(),
       prepareSettlementTransaction: async transaction => ({
         ...transaction,
         Sequence: 1,
         Fee: "12",
         LastLedgerSequence: CURRENT_LEDGER + 20,
       }),
+      ...overrides,
     });
   }
 
@@ -1560,6 +1629,64 @@ describe("UptoXrplScheme server", () => {
     expect((claim.Flags as number) & PaymentChannelClaimFlags.tfClose).not.toBe(0);
   });
 
+  it("signs a bare close when the channel already delivered the charge", async () => {
+    // The source raised the channel's Balance to the charge before settle:
+    // a claim's Balance must exceed the delivered total, so the charge can
+    // no longer be expressed as a claim.
+    const server = createServer({
+      getPayChannel: async () => makeChannel({ Balance: "2470000" }),
+    });
+    const enrichment = await server.enrichSettlementPayload(
+      settleContext(makePayload(), makeRequirements({ amount: "2470000" })),
+    );
+    const claim = decode(
+      (enrichment as Record<string, unknown>).settlementTransaction as string,
+    ) as unknown as PaymentChannelClaim;
+    expect(claim.Balance).toBeUndefined();
+    expect(claim.Amount).toBeUndefined();
+    expect(claim.Signature).toBeUndefined();
+    expect(claim.PublicKey).toBeUndefined();
+    expect((claim.Flags as number) & PaymentChannelClaimFlags.tfClose).not.toBe(0);
+    expect((claim.Flags as number) & PaymentChannelClaimFlags.tfRenew).toBe(0);
+  });
+
+  it("signs a bare close when the channel over-delivered the charge", async () => {
+    const server = createServer({
+      getPayChannel: async () => makeChannel({ Balance: "3000000" }),
+    });
+    const enrichment = await server.enrichSettlementPayload(
+      settleContext(makePayload(), makeRequirements({ amount: "2470000" })),
+    );
+    const claim = decode(
+      (enrichment as Record<string, unknown>).settlementTransaction as string,
+    ) as unknown as PaymentChannelClaim;
+    expect(claim.Balance).toBeUndefined();
+    expect(claim.Signature).toBeUndefined();
+  });
+
+  it("still signs a claim when the channel delivered less than the charge", async () => {
+    const server = createServer({
+      getPayChannel: async () => makeChannel({ Balance: "2469999" }),
+    });
+    const enrichment = await server.enrichSettlementPayload(
+      settleContext(makePayload(), makeRequirements({ amount: "2470000" })),
+    );
+    const claim = decode(
+      (enrichment as Record<string, unknown>).settlementTransaction as string,
+    ) as unknown as PaymentChannelClaim;
+    expect(claim.Balance).toBe("2470000");
+    expect(claim.Amount).toBe(MAX_DROPS);
+  });
+
+  it("refuses to sign against a channel that no longer exists", async () => {
+    const server = createServer({ getPayChannel: async () => undefined });
+    await expect(
+      server.enrichSettlementPayload(
+        settleContext(makePayload(), makeRequirements({ amount: "2470000" })),
+      ),
+    ).rejects.toThrow("channel not found");
+  });
+
   it("refuses to sign above the authorized maximum", async () => {
     await expect(
       createServer().enrichSettlementPayload(
@@ -1586,7 +1713,7 @@ describe("UptoXrplScheme server", () => {
 
   it("requires the prepared claim to carry LastLedgerSequence", async () => {
     // The facilitator bounds the claim's landable window from this field.
-    const server = new UptoXrplServerScheme(createXrplWalletSigner(payToWallet), {
+    const server = createServer({
       prepareSettlementTransaction: async transaction => ({
         ...transaction,
         Sequence: 1,
@@ -1756,6 +1883,7 @@ describe("upto XRPL end to end", () => {
     });
 
     const serverScheme = new UptoXrplServerScheme(createXrplWalletSigner(payToWallet), {
+      getPayChannel: async channelId => channels.get(channelId.toUpperCase()),
       prepareSettlementTransaction: async transaction => ({
         ...transaction,
         Sequence: 9,

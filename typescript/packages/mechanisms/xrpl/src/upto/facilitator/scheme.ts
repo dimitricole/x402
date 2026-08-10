@@ -65,7 +65,7 @@ export class UptoXrplScheme implements SchemeNetworkFacilitator {
    * Gets XRPL mechanism-specific supported metadata.
    *
    * @param _network - Network identifier
-   * @returns Extra metadata advertising the transfer method and unsponsored fees
+   * @returns Extra metadata advertising that fees are never sponsored
    */
   getExtra(_network: Network): Record<string, unknown> | undefined {
     return { areFeesSponsored: false };
@@ -82,7 +82,7 @@ export class UptoXrplScheme implements SchemeNetworkFacilitator {
   }
 
   /**
-   * Verifies that a channel authorizes at least the required amount.
+   * Verifies that a channel authorizes exactly the required amount.
    *
    * At verify time `requirements.amount` carries the authorized **maximum**.
    *
@@ -133,11 +133,12 @@ export class UptoXrplScheme implements SchemeNetworkFacilitator {
 
       // Re-verification must run against the authorized maximum, not the
       // actual charge.
+      const channelState: { channel?: PayChannelEntry } = {};
       const verification = await this.verifyPayment(
         payload,
         { ...requirements, amount: uptoPayload.maxAmount },
         "settle",
-        settleAmount,
+        channelState,
       );
       if (!verification.isValid) {
         return failedSettle(
@@ -156,12 +157,17 @@ export class UptoXrplScheme implements SchemeNetworkFacilitator {
 
       const settlementBlob = uptoPayload.settlementTransaction;
       if (typeof settlementBlob !== "string" || settlementBlob === "") {
-        return failedSettle(
-          "invalid_upto_xrpl_payload_missing_settlement_transaction",
-          network,
-          payer,
-        );
+        return failedSettle("invalid_upto_xrpl_missing_settlement_transaction", network, payer);
       }
+      // The source can raise the channel's Balance unilaterally, so a charge
+      // it already covers cannot be expressed as a claim (a claim's Balance
+      // must exceed the delivered total): like a zero settlement, it is a
+      // bare destination close, which refunds only the undrawn remainder.
+      const delivered = parseDrops(channelState.channel?.Balance);
+      if (delivered === undefined) {
+        return failedSettle("invalid_upto_xrpl_facilitator_error", network, payer);
+      }
+      const bareClose = settleAmount === 0n || delivered >= settleAmount;
       // A non-integer clock would defeat every window comparison below and
       // give the dedup entry a NaN expiry, which never prunes.
       const currentLedgerIndex = await getCurrentLedgerIndex(requirements.network, this.options);
@@ -173,6 +179,7 @@ export class UptoXrplScheme implements SchemeNetworkFacilitator {
         uptoPayload,
         requirements,
         settleAmount,
+        bareClose,
         currentLedgerIndex,
       );
       if ("reason" in claimCheck) {
@@ -215,9 +222,14 @@ export class UptoXrplScheme implements SchemeNetworkFacilitator {
         // A claim applied to a channel that expired first closes it without
         // delivering and still returns tesSUCCESS, so the result code alone
         // is not evidence of payment: confirm the delivered amount from the
-        // transaction metadata when the submission path provides it.
+        // transaction metadata when the submission path provides it. For a
+        // bare close the evidence is the settle-time validated Balance read
+        // instead: the charge was delivered before submission, so the closing
+        // transaction legitimately delivers nothing. Balance is monotonic, so
+        // a final balance at or above the charge means the destination holds
+        // the funds even when the source delivered them past our own read.
         const settledBalance = getFinalChannelBalance(result.meta, uptoPayload.channelId);
-        if (settleAmount > 0n && settledBalance !== undefined && settledBalance !== settleAmount) {
+        if (!bareClose && settledBalance !== undefined && settledBalance < settleAmount) {
           return failedSettle(
             "transaction_failed: channel_expired_before_claim",
             network,
@@ -263,14 +275,16 @@ export class UptoXrplScheme implements SchemeNetworkFacilitator {
    * @param payload - Payment payload
    * @param requirements - Payment requirements
    * @param phase - Whether this runs before the metered work or at settlement
-   * @param settleAmount - Actual settlement amount in drops, at settle time
+   * @param channelOut - Receives the channel entry this verification read, so
+   *   settlement decides the claim form from the same validated-ledger state
+   * @param channelOut.channel - The channel entry, set once the read succeeds
    * @returns Verification response
    */
   private async verifyPayment(
     payload: PaymentPayload,
     requirements: PaymentRequirements,
     phase: "verify" | "settle",
-    settleAmount?: bigint,
+    channelOut?: { channel?: PayChannelEntry },
   ): Promise<VerifyResponse> {
     let payer = "";
     try {
@@ -321,6 +335,9 @@ export class UptoXrplScheme implements SchemeNetworkFacilitator {
       if (!channel) {
         return invalidVerify("invalid_upto_xrpl_channel_not_found", payer);
       }
+      if (channelOut) {
+        channelOut.channel = channel;
+      }
 
       const channelError = this.verifyChannelBinding(
         channel,
@@ -329,7 +346,6 @@ export class UptoXrplScheme implements SchemeNetworkFacilitator {
         requiredAmount,
         maxAmount,
         phase,
-        settleAmount,
       );
       if (channelError) {
         return invalidVerify(channelError, payer);
@@ -425,7 +441,6 @@ export class UptoXrplScheme implements SchemeNetworkFacilitator {
    * @param requiredAmount - Required amount in drops
    * @param maxAmount - Authorized maximum in drops
    * @param phase - Whether this runs before the metered work or at settlement
-   * @param settleAmount - Actual settlement amount in drops, at settle time
    * @returns Invalid reason, if validation fails
    */
   private verifyChannelBinding(
@@ -435,7 +450,6 @@ export class UptoXrplScheme implements SchemeNetworkFacilitator {
     requiredAmount: bigint,
     maxAmount: bigint,
     phase: "verify" | "settle",
-    settleAmount: bigint | undefined,
   ): string | undefined {
     // A user-supplied getPayChannel is not bound by PayChannelEntry at runtime.
     if (
@@ -484,16 +498,13 @@ export class UptoXrplScheme implements SchemeNetworkFacilitator {
       return "invalid_upto_xrpl_claim_signature";
     }
 
-    // Single use, before the work begins. At settlement the ledger's own rule
-    // applies instead: `Balance` is the cumulative delivered total and a claim
-    // need only exceed it, else a payer could strand the settlement by drawing
-    // one drop against its own channel after consuming the work.
-    const delivered = parseDrops(channel.Balance) as bigint;
-    if (phase === "verify") {
-      if (delivered !== 0n) {
-        return "invalid_upto_xrpl_channel_already_drawn";
-      }
-    } else if (settleAmount !== undefined && settleAmount > 0n && delivered >= settleAmount) {
+    // Single use, before the work begins. At settlement any Balance is
+    // acceptable: the source can deliver drops unilaterally at any time, so a
+    // nonzero Balance below the charge only pre-pays part of the bill (the
+    // claim delivers the difference), and one at or above it means the charge
+    // is already delivered and settlement is a bare close. Refusing over
+    // either would strand a payment the ledger can still settle.
+    if (phase === "verify" && parseDrops(channel.Balance) !== 0n) {
       return "invalid_upto_xrpl_channel_already_drawn";
     }
     return undefined;
@@ -574,6 +585,8 @@ export class UptoXrplScheme implements SchemeNetworkFacilitator {
    * @param uptoPayload - XRPL upto payload
    * @param requirements - Payment requirements
    * @param settleAmount - Actual settlement amount in drops
+   * @param bareClose - Whether the settlement must be a bare destination
+   *   close: a zero charge, or one the channel's Balance already covers
    * @param currentLedgerIndex - Current validated ledger index
    * @returns The blob's signing key and ledger window, else a reason and detail
    */
@@ -582,6 +595,7 @@ export class UptoXrplScheme implements SchemeNetworkFacilitator {
     uptoPayload: UptoXrplPayload,
     requirements: PaymentRequirements,
     settleAmount: bigint,
+    bareClose: boolean,
     currentLedgerIndex: number,
   ): { signingPubKey: string; lastLedgerSequence: number } | { reason: string; message: string } {
     const mismatch = (message: string): { reason: string; message: string } => ({
@@ -666,16 +680,17 @@ export class UptoXrplScheme implements SchemeNetworkFacilitator {
       return mismatch("tfRenew set");
     }
 
-    if (settleAmount === 0n) {
-      // A zero charge cannot be expressed as a claim; it is a bare
-      // destination close (see buildSettlementTransaction on the server).
+    if (bareClose) {
+      // Neither a zero charge nor one the channel already delivered can be
+      // expressed as a claim; each is a bare destination close (see
+      // buildSettlementTransaction on the server).
       if (
         claim.Balance !== undefined ||
         claim.Amount !== undefined ||
         claim.Signature !== undefined ||
         claim.PublicKey !== undefined
       ) {
-        return mismatch("zero settlement must be a bare close");
+        return mismatch("zero or pre-delivered settlement must be a bare close");
       }
       return { signingPubKey, lastLedgerSequence: claim.LastLedgerSequence };
     }
