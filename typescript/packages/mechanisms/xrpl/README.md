@@ -1,6 +1,6 @@
 # `@x402/xrpl` [![npm version](https://img.shields.io/npm/v/%40x402%2Fxrpl.svg)](https://www.npmjs.com/package/@x402/xrpl)
 
-XRPL implementation of the x402 payment protocol using the **Exact** payment scheme with payer-signed XRP Ledger `Payment` transactions.
+XRPL implementation of the x402 payment protocol: the **Exact** payment scheme with payer-signed XRP Ledger `Payment` transactions, and the **Upto** payment scheme with XRPL Payment Channels.
 
 ## Installation
 
@@ -25,6 +25,7 @@ The payer signs a complete XRPL `Payment` transaction and pays the XRPL transact
 ### Main Package (`@x402/xrpl`)
 
 - `createXrplWalletSigner(wallet)` - Creates a client signer from an `xrpl` `Wallet`.
+- `createUptoXrplWalletSigner(wallet)` - Creates an upto client signer, which also signs off-ledger channel claims.
 - `createTickets(signer, network, ticketCount)` - Creates XRPL Tickets for `ticketSequence` payments.
 - `getXrplTicketSequences(account, network)` - Lists an account's available ticket sequences.
 - `invoiceIdToInvoiceIdField(invoiceId)` - Converts an invoice id to an XRPL `InvoiceID`.
@@ -35,6 +36,9 @@ The payer signs a complete XRPL `Payment` transaction and pays the XRPL transact
 - `@x402/xrpl/exact/client` - `ExactXrplScheme` client implementation.
 - `@x402/xrpl/exact/server` - `ExactXrplScheme` server implementation.
 - `@x402/xrpl/exact/facilitator` - `ExactXrplScheme` facilitator implementation.
+- `@x402/xrpl/upto/client` - `UptoXrplScheme` client implementation.
+- `@x402/xrpl/upto/server` - `UptoXrplScheme` server implementation.
+- `@x402/xrpl/upto/facilitator` - `UptoXrplScheme` facilitator implementation.
 
 ## Supported Networks
 
@@ -148,6 +152,65 @@ const facilitator = new x402Facilitator().register("xrpl:*", new ExactXrplScheme
 ```
 
 Verification enforces the spec's checks: envelope consistency, offline signature validation, signer-to-account authorization (the embedded `SigningPubKey` must be the account's master key pair, unless disabled, or its configured regular key), destination and amount matching, NetworkID binding, per-method sequencing (current account `Sequence`, or ticket availability), `LastLedgerSequence` expiry policy, invoice binding via `InvoiceID`, fee caps, safety rejections (`Delegate`, `Memos`, `Paths`, `DeliverMin`, partial payments, multisigned blobs), and an XRPL simulation. Settlement re-runs verification, submits the signed blob, and succeeds only on a validated `tesSUCCESS` result.
+
+## Upto Scheme
+
+`upto` authorizes a transfer of up to a maximum amount; the actual charge is determined at settlement from measured consumption. XRPL realizes it with [Payment Channels](https://xrpl.org/docs/concepts/payment-types/payment-channels): the payer escrows the ceiling in a channel and signs one off-ledger claim over `(channelId, maxAmount)`, and the resource server later claims the actual amount and closes the channel, refunding the remainder. XRP only — Payment Channels cannot carry issued currencies.
+
+The facilitator holds no key and pays no fee. Closing a channel atomically requires the transaction to originate from the channel `Destination`, so the resource server — the party that knows the actual charge — signs the settlement `PaymentChannelClaim`, and the facilitator verifies and relays it.
+
+### Client
+
+```typescript
+import { Wallet } from "xrpl";
+import { x402Client } from "@x402/core/client";
+import { createUptoXrplWalletSigner } from "@x402/xrpl";
+import { UptoXrplScheme } from "@x402/xrpl/upto/client";
+
+const wallet = Wallet.fromSeed(process.env.XRPL_SEED!);
+const signer = createUptoXrplWalletSigner(wallet);
+
+const client = new x402Client().register("xrpl:*", new UptoXrplScheme(signer));
+```
+
+`createPaymentPayload` submits a `PaymentChannelCreate` escrowing the required maximum and signs the off-ledger claim. The channel's `SettleDelay` honors `extra.minSettleDelay`, its `CancelAfter` covers `maxTimeoutSeconds` plus landing margins, and the owner reserve is held while the channel is open. The unused remainder is refunded when settlement closes the channel.
+
+### Server
+
+```typescript
+import { Wallet } from "xrpl";
+import { createXrplWalletSigner } from "@x402/xrpl";
+import { UptoXrplScheme } from "@x402/xrpl/upto/server";
+
+const payToWallet = Wallet.fromSeed(process.env.XRPL_PAYTO_SEED!);
+const server = new UptoXrplScheme(createXrplWalletSigner(payToWallet));
+```
+
+The signer must be authorized for the `payTo` account: its master key pair (unless disabled) or its configured regular key. After verification and the metered work, build the settle-time requirements with the actual charge and pass them to the facilitator's `/settle`:
+
+```typescript
+const settleRequirements = await server.buildSettlementRequirements(paymentPayload, {
+  ...requirements,
+  amount: actualDrops, // the measured charge; "0" refunds the deposit in full
+});
+```
+
+`buildSettlementRequirements` signs the `PaymentChannelClaim` that closes the channel and places the blob in `extra.settlementTransaction`. That field is settle-time only; `enhancePaymentRequirements` refuses requirements that already carry one, so it can never appear in a `PAYMENT-REQUIRED` challenge.
+
+### Facilitator
+
+```typescript
+import { x402Facilitator } from "@x402/core/facilitator";
+import { UptoXrplScheme } from "@x402/xrpl/upto/facilitator";
+
+const facilitator = new x402Facilitator().register("xrpl:*", new UptoXrplScheme());
+```
+
+Verification reads the `PayChannel` from a validated ledger and enforces the spec's checks: envelope consistency, channel bindings (destination, payer, public key), the payer's claim signature over `(channelId, maxAmount)`, single use (`Balance` is `0`), and time bounds with a landing margin so an admitted payment is still settleable once the metered work has run. Settlement re-verifies against the authorized maximum, checks the server-signed claim's bindings and signer authorization, submits it, and succeeds only on a validated `tesSUCCESS`; when the submission path returns transaction metadata, the delivered amount is confirmed from it, because a claim landing on an expired channel closes it without delivering and still returns `tesSUCCESS`.
+
+Upto settlements are deduplicated on `(network, channelId)` — the channel can be drawn only once — using the same `SettlementCache` described below, and the entry is released when submission returns a validated non-`tesSUCCESS` result, since a per-settlement server-signed claim cannot double-pay the way a replayed exact blob can.
+
+For protocol details, see [`scheme_upto_xrpl.md`](../../../../specs/schemes/upto/scheme_upto_xrpl.md).
 
 ## Duplicate Settlement Protection
 
