@@ -49,6 +49,14 @@ export class UptoXrplScheme implements SchemeNetworkFacilitator {
   readonly scheme = "upto";
   private readonly options: XrplFacilitatorOptions;
   private readonly settlementCache: SettlementCache;
+  /**
+   * Advisory in-flight entries keyed like the settlement cache: two payments
+   * presenting one channel both pass the validated-ledger read, so the second
+   * is refused until the first settles or its window lapses. Per-process
+   * defense in depth; the resource server's no-concurrent-work rule stays
+   * primary.
+   */
+  private readonly inflightCache = new SettlementCache();
 
   /**
    * Creates a new XRPL upto facilitator scheme.
@@ -94,7 +102,23 @@ export class UptoXrplScheme implements SchemeNetworkFacilitator {
     payload: PaymentPayload,
     requirements: PaymentRequirements,
   ): Promise<VerifyResponse> {
-    return this.verifyPayment(payload, requirements, "verify");
+    const response = await this.verifyPayment(payload, requirements, "verify");
+    if (!response.isValid) {
+      return response;
+    }
+    // Checked and taken atomically (synchronous within one call). The
+    // verify-phase entry expires with the admission window; once a settlement
+    // attempt exists the settlement entry guards the channel instead,
+    // carrying the claim's landable window and release rules.
+    const uptoPayload = getUptoXrplPayload(payload);
+    if (uptoPayload) {
+      const key = `${requirements.network}:${uptoPayload.channelId.toUpperCase()}`;
+      const ttlMs = (requirements.maxTimeoutSeconds + LANDING_MARGIN_SECONDS) * 1000;
+      if (this.settlementCache.has(key) || this.inflightCache.isDuplicate(key, ttlMs)) {
+        return invalidVerify("invalid_upto_xrpl_channel_in_flight", response.payer ?? "");
+      }
+    }
+    return response;
   }
 
   /**
@@ -199,6 +223,10 @@ export class UptoXrplScheme implements SchemeNetworkFacilitator {
       if (settlementToken === undefined) {
         return failedSettle("duplicate_settlement", network, payer);
       }
+      // The settlement entry now guards the channel with the claim's
+      // landable window and release rules; the verify-phase in-flight entry
+      // it supersedes is dropped.
+      this.inflightCache.evict(settlementKey);
 
       try {
         const result = await submitSignedTransaction(
@@ -556,9 +584,9 @@ export class UptoXrplScheme implements SchemeNetworkFacilitator {
       ) {
         return "invalid_upto_xrpl_insufficient_time_bound";
       }
-      // A close requested the moment the work starts must still leave the
-      // destination time to land its claim.
-      if (channel.SettleDelay < LANDING_MARGIN_SECONDS) {
+      // A source close scheduled mid-work expires the channel SettleDelay
+      // later, so the delay must cover the work as well as the landing.
+      if (channel.SettleDelay < requirements.maxTimeoutSeconds + LANDING_MARGIN_SECONDS) {
         return "invalid_upto_xrpl_settle_delay_too_short";
       }
       // Admission-only: SettleDelay is fixed at PaymentChannelCreate, so it

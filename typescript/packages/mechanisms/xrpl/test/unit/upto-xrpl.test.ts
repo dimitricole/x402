@@ -71,7 +71,7 @@ function makeChannel(overrides: Partial<PayChannelEntry> = {}): PayChannelEntry 
     Amount: MAX_DROPS,
     Balance: "0",
     PublicKey: payerWallet.publicKey,
-    SettleDelay: 60,
+    SettleDelay: 600,
     CancelAfter: CANCEL_AFTER,
     ...overrides,
   };
@@ -352,12 +352,132 @@ describe("UptoXrplScheme facilitator verify", () => {
     expect(result.invalidReason).toBe("invalid_upto_xrpl_insufficient_time_bound");
   });
 
-  it("rejects a settle delay too short for a claim to land", async () => {
+  it("rejects a settle delay shorter than the work plus the landing", async () => {
+    // A source close scheduled mid-work expires the channel SettleDelay
+    // later, so a delay below maxTimeoutSeconds plus the margin admits a
+    // channel the payer can expire under a longer-running claim.
     const requirements = makeRequirements({ extra: { minSettleDelay: undefined } });
     const result = await createFacilitator({
-      getPayChannel: async () => makeChannel({ SettleDelay: 19 }),
+      getPayChannel: async () =>
+        makeChannel({
+          SettleDelay: requirements.maxTimeoutSeconds + LANDING_MARGIN_SECONDS - 1,
+        }),
     }).verify(makePayload({}, requirements), requirements);
     expect(result.invalidReason).toBe("invalid_upto_xrpl_settle_delay_too_short");
+  });
+
+  it("accepts a settle delay of exactly the work plus the landing", async () => {
+    const requirements = makeRequirements({ extra: { minSettleDelay: undefined } });
+    const result = await createFacilitator({
+      getPayChannel: async () =>
+        makeChannel({
+          SettleDelay: requirements.maxTimeoutSeconds + LANDING_MARGIN_SECONDS,
+        }),
+    }).verify(makePayload({}, requirements), requirements);
+    expect(result.isValid).toBe(true);
+  });
+
+  it("refuses a second verification while the channel is in flight", async () => {
+    // Two in-flight payments on one channel both pass the validated-ledger
+    // read; the advisory entry refuses the second at the same facilitator.
+    const facilitator = createFacilitator();
+    const first = await facilitator.verify(makePayload(), baseRequirements);
+    expect(first.isValid).toBe(true);
+    const second = await facilitator.verify(makePayload(), baseRequirements);
+    expect(second.isValid).toBe(false);
+    expect(second.invalidReason).toBe("invalid_upto_xrpl_channel_in_flight");
+  });
+
+  it("expires the in-flight entry when no settlement arrives", async () => {
+    // The verify-phase entry's own window is the admission window, 300s of
+    // work plus the 20s margin here; past it, an abandoned verify no longer
+    // blocks the channel.
+    vi.useFakeTimers();
+    try {
+      const facilitator = createFacilitator();
+      expect((await facilitator.verify(makePayload(), baseRequirements)).isValid).toBe(true);
+
+      vi.advanceTimersByTime(319_000);
+      const duringWindow = await facilitator.verify(makePayload(), baseRequirements);
+      expect(duringWindow.invalidReason).toBe("invalid_upto_xrpl_channel_in_flight");
+
+      vi.advanceTimersByTime(2_000);
+      const afterWindow = await facilitator.verify(makePayload(), baseRequirements);
+      expect(afterWindow.isValid).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("scopes the in-flight entry to the facilitator instance", async () => {
+    // Advisory and per-process: a payment verifying through another
+    // facilitator still passes, so the resource-server rule stays primary.
+    const first = await createFacilitator().verify(makePayload(), baseRequirements);
+    const second = await createFacilitator().verify(makePayload(), baseRequirements);
+    expect(first.isValid).toBe(true);
+    expect(second.isValid).toBe(true);
+  });
+
+  it("releases the in-flight entry on a definitive settlement failure", async () => {
+    // A validated rejection is definitive: nothing landed and nothing can,
+    // so the channel may be verified afresh.
+    const facilitator = createFacilitator({
+      submitSignedTransaction: async () => ({
+        hash: "DEF",
+        validated: true,
+        resultCode: "tecNO_TARGET",
+      }),
+    });
+    expect((await facilitator.verify(makePayload(), baseRequirements)).isValid).toBe(true);
+    const settled = await facilitator.settle(
+      settlePayload("2500000"),
+      settleRequirements("2500000"),
+    );
+    expect(settled.success).toBe(false);
+    const again = await facilitator.verify(makePayload(), baseRequirements);
+    expect(again.isValid).toBe(true);
+  });
+
+  it("retains the in-flight entry after a successful settlement", async () => {
+    // Until the ledger read reflects the close, the settlement entry is what
+    // refuses a re-verify of the settled channel.
+    const facilitator = createFacilitator();
+    expect((await facilitator.verify(makePayload(), baseRequirements)).isValid).toBe(true);
+    const settled = await facilitator.settle(
+      settlePayload("2500000"),
+      settleRequirements("2500000"),
+    );
+    expect(settled.success).toBe(true);
+    const again = await facilitator.verify(makePayload(), baseRequirements);
+    expect(again.invalidReason).toBe("invalid_upto_xrpl_channel_in_flight");
+  });
+
+  it("hands the in-flight guard to the settlement entry's own window", async () => {
+    // A settlement attempt supersedes the verify-phase entry: after it, the
+    // refusal window is the claim's landable horizon (10 ledgers at 10s plus
+    // the 120s floor: 220s here), not the admission window (320s). Probing
+    // between the two distinguishes the settlement entry from a leftover
+    // verify-phase entry.
+    vi.useFakeTimers();
+    try {
+      const facilitator = createFacilitator();
+      expect((await facilitator.verify(makePayload(), baseRequirements)).isValid).toBe(true);
+      const settled = await facilitator.settle(
+        settlePayload("2500000"),
+        settleRequirements("2500000"),
+      );
+      expect(settled.success).toBe(true);
+
+      vi.advanceTimersByTime(200_000);
+      const duringWindow = await facilitator.verify(makePayload(), baseRequirements);
+      expect(duringWindow.invalidReason).toBe("invalid_upto_xrpl_channel_in_flight");
+
+      vi.advanceTimersByTime(30_000);
+      const afterWindow = await facilitator.verify(makePayload(), baseRequirements);
+      expect(afterWindow.isValid).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("admits only channels settlement will accept", async () => {
@@ -1758,7 +1878,7 @@ describe("UptoXrplScheme client", () => {
     expect(create.Account).toBe(payerWallet.classicAddress);
     expect(create.Destination).toBe(payTo);
     expect(create.Amount).toBe(MAX_DROPS);
-    expect(create.SettleDelay).toBe(60);
+    expect(create.SettleDelay).toBe(baseRequirements.maxTimeoutSeconds + LANDING_MARGIN_SECONDS);
     expect(create.CancelAfter).toBe(
       CLOSE_TIME + baseRequirements.maxTimeoutSeconds + 3 * LANDING_MARGIN_SECONDS,
     );
@@ -1780,12 +1900,20 @@ describe("UptoXrplScheme client", () => {
     ).toBe(true);
   });
 
-  it("uses the landing margin when no minSettleDelay is required", async () => {
+  it("covers the work plus the landing when no minSettleDelay is required", async () => {
     const submitted: string[] = [];
     const requirements = makeRequirements({ extra: { minSettleDelay: undefined } });
     await createClient(submitted).createPaymentPayload(2, requirements);
     const create = decode(submitted[0]) as unknown as PaymentChannelCreate;
-    expect(create.SettleDelay).toBe(LANDING_MARGIN_SECONDS);
+    expect(create.SettleDelay).toBe(requirements.maxTimeoutSeconds + LANDING_MARGIN_SECONDS);
+  });
+
+  it("honors a minSettleDelay above the work-plus-landing floor", async () => {
+    const submitted: string[] = [];
+    const requirements = makeRequirements({ extra: { minSettleDelay: 900 } });
+    await createClient(submitted).createPaymentPayload(2, requirements);
+    const create = decode(submitted[0]) as unknown as PaymentChannelCreate;
+    expect(create.SettleDelay).toBe(900);
   });
 
   it("rejects a failed channel create", async () => {

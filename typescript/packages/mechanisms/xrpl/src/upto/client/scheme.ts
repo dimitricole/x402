@@ -103,8 +103,11 @@ export class UptoXrplScheme implements SchemeNetworkClient {
     const ledgerCloseTime = await getLedgerCloseTime(requirements.network, this.options);
 
     const minSettleDelay = requirements.extra?.minSettleDelay;
+    // Verification requires the delay to cover the metered work plus the
+    // landing, so a mid-work source close cannot expire the channel under
+    // the claim.
     const settleDelay = Math.max(
-      LANDING_MARGIN_SECONDS,
+      requirements.maxTimeoutSeconds + LANDING_MARGIN_SECONDS,
       typeof minSettleDelay === "number" ? minSettleDelay : 0,
     );
     // Verification demands maxTimeoutSeconds plus a landing margin remaining

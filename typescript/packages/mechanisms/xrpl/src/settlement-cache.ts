@@ -63,6 +63,31 @@ export class SettlementCache {
   }
 
   /**
+   * Returns whether `key` currently holds a live entry.
+   *
+   * @param key - The unique identifier to look up.
+   * @returns `true` while an unexpired entry holds the key.
+   */
+  has(key: string): boolean {
+    this.prune();
+    return this.entries.has(key);
+  }
+
+  /**
+   * Removes `key` unconditionally, regardless of holder.
+   *
+   * For supersession only: when another guard takes over the same identity
+   * (a settlement entry superseding a verify-phase in-flight entry), the
+   * displaced entry is deleted without a token. Everywhere else use
+   * {@link release}, which cannot cancel another holder's protection.
+   *
+   * @param key - The unique identifier to remove.
+   */
+  evict(key: string): void {
+    this.entries.delete(key);
+  }
+
+  /**
    * Releases a key claimed by {@link acquire}, re-allowing settlement.
    *
    * For a settlement whose submission definitively failed (a final result in
