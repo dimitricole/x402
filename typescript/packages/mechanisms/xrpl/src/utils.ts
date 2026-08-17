@@ -215,6 +215,27 @@ export function isValidDestinationTag(value: unknown): value is number {
 }
 
 /**
+ * Builds the default LastLedgerSequence a client should sign.
+ *
+ * Deliberately excludes {@link DEFAULT_LEDGER_TOLERANCE}: the facilitator
+ * accepts up to {@link getMaxLastLedgerSequence} computed from its own
+ * ledger view, so the tolerance ledgers remain available as slack when the
+ * client's node is ahead of the facilitator's.
+ *
+ * @param currentLedgerIndex - Current validated ledger index
+ * @param requirements - Payment requirements
+ * @returns Default LastLedgerSequence for a client-built transaction
+ */
+export function getDefaultLastLedgerSequence(
+  currentLedgerIndex: number,
+  requirements: PaymentRequirements,
+): number {
+  return (
+    currentLedgerIndex + Math.ceil(requirements.maxTimeoutSeconds / DEFAULT_LEDGER_CLOSE_SECONDS)
+  );
+}
+
+/**
  * Builds the max allowed LastLedgerSequence for requirements.
  *
  * @param currentLedgerIndex - Current validated ledger index
@@ -225,11 +246,7 @@ export function getMaxLastLedgerSequence(
   currentLedgerIndex: number,
   requirements: PaymentRequirements,
 ): number {
-  return (
-    currentLedgerIndex +
-    Math.ceil(requirements.maxTimeoutSeconds / DEFAULT_LEDGER_CLOSE_SECONDS) +
-    DEFAULT_LEDGER_TOLERANCE
-  );
+  return getDefaultLastLedgerSequence(currentLedgerIndex, requirements) + DEFAULT_LEDGER_TOLERANCE;
 }
 
 /**
@@ -263,6 +280,40 @@ export function isIssuedCurrencyAmount(amount: unknown): amount is {
     typeof amount.issuer === "string" &&
     typeof amount.value === "string"
   );
+}
+
+const NONSTANDARD_CURRENCY_PATTERN = /^[0-9A-Fa-f]{40}$/;
+const STANDARD_CURRENCY_BYTES_PATTERN = /^0{24}([0-9A-F]{6})0{10}$/;
+// Mirrors ripple-binary-codec's ISO_REGEX exactly (no `<>`), and the codec
+// likewise keeps the hex form when the standard slot spells "XRP".
+const ISO_CURRENCY_CHAR_PATTERN = /^[A-Z0-9a-z?!@#$%^&*(){}[\]|]{3}$/;
+
+/**
+ * Normalizes a currency code to the form the XRPL binary codec emits.
+ *
+ * The codec decodes standard currencies to their 3-character form and
+ * nonstandard currencies to uppercase 40-hex, so a requirement advertised
+ * as lowercase hex, or as the hex encoding of a standard code, would never
+ * match a decoded transaction under exact string comparison. 3-character
+ * codes are returned unchanged: XRPL currency codes are case-sensitive
+ * ("USD" and "usd" are distinct currencies).
+ *
+ * @param currency - Currency code as advertised (3-char or 160-bit hex)
+ * @returns Codec-canonical currency code
+ */
+export function normalizeCurrencyCode(currency: string): string {
+  if (!NONSTANDARD_CURRENCY_PATTERN.test(currency)) {
+    return currency;
+  }
+  const upper = currency.toUpperCase();
+  const standard = STANDARD_CURRENCY_BYTES_PATTERN.exec(upper);
+  if (standard) {
+    const iso = Buffer.from(standard[1], "hex").toString("latin1");
+    if (iso !== "XRP" && ISO_CURRENCY_CHAR_PATTERN.test(iso)) {
+      return iso;
+    }
+  }
+  return upper;
 }
 
 /**

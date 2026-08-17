@@ -1,6 +1,10 @@
 import {
   CANONICAL_SIGNING_PUB_KEY_PATTERN,
+  DEFAULT_LEDGER_CLOSE_SECONDS,
+  DEFAULT_LEDGER_TOLERANCE,
   DEFAULT_MAX_FEE_DROPS,
+  DEFAULT_MAX_TIMEOUT_SECONDS,
+  MAX_LEDGER_CLOSE_MS,
   SETTLEMENT_TTL_MS,
   TF_PARTIAL_PAYMENT,
   XRPL_CAIP_FAMILY,
@@ -20,13 +24,14 @@ import {
   isValidDestinationTag,
   isXrplNetwork,
   isXrplTicketAvailable,
+  normalizeCurrencyCode,
   parseXrplNetworkId,
   requireClassicAddress,
   resolveAssetTransferMethod,
   simulateSignedTransaction,
   submitSignedTransaction,
 } from "../../utils";
-import { SettlementCache } from "../../settlement-cache";
+import { SettlementCache, type SettlementStore } from "../../settlement-cache";
 import type { XrplAssetTransferMethod, XrplFacilitatorOptions } from "../../types";
 import type {
   Network,
@@ -45,15 +50,17 @@ export class ExactXrplScheme implements SchemeNetworkFacilitator {
   readonly caipFamily = XRPL_CAIP_FAMILY;
   readonly scheme = "exact";
   private readonly options: XrplFacilitatorOptions;
-  private readonly settlementCache: SettlementCache;
+  private readonly settlementCache: SettlementStore;
 
   /**
    * Creates a new XRPL exact facilitator scheme.
    *
    * @param options - Facilitator configuration
-   * @param settlementCache - Optional shared settlement cache; a private one is created by default
+   * @param settlementCache - Optional shared settlement store; a private
+   *   in-memory cache is created by default. Horizontally scaled
+   *   facilitators must pass a store backed by shared atomic storage.
    */
-  constructor(options: XrplFacilitatorOptions = {}, settlementCache?: SettlementCache) {
+  constructor(options: XrplFacilitatorOptions = {}, settlementCache?: SettlementStore) {
     this.options = options;
     this.settlementCache = settlementCache ?? new SettlementCache();
   }
@@ -199,17 +206,17 @@ export class ExactXrplScheme implements SchemeNetworkFacilitator {
     const exactPayload = getExactXrplPayload(payload);
     const transactionHash = getSignedTransactionHash(exactPayload.signedTxBlob);
 
-    // XRPL submission is idempotent on the transaction hash: submitAndWait for
-    // an already-submitted hash resolves tesSUCCESS again, so concurrent settle
-    // calls carrying the same signed blob would each report success while only
-    // one payment lands. The check + insert below is synchronous, so concurrent
-    // calls that all passed verification are still serialized correctly. The
-    // entry is retained for the transaction's landable window (its
-    // LastLedgerSequence is derived from maxTimeoutSeconds) plus a margin, so it
-    // cannot be evicted while a slow-to-validate duplicate could still pass
-    // re-verification.
-    const settlementTtlMs = requirements.maxTimeoutSeconds * 1000 + SETTLEMENT_TTL_MS;
-    if (this.settlementCache.isDuplicate(transactionHash, settlementTtlMs)) {
+    // XRPL submission is idempotent on the transaction hash, so concurrent
+    // settle calls carrying the same signed blob would each report success
+    // while only one payment lands; the store's atomic check + insert (see
+    // SettlementStore) serializes them. The entry must outlive the
+    // transaction's landable window, bounded in ledgers, hence the
+    // MAX_LEDGER_CLOSE_MS-based TTL.
+    const maxLedgerDelta =
+      Math.ceil(requirements.maxTimeoutSeconds / DEFAULT_LEDGER_CLOSE_SECONDS) +
+      DEFAULT_LEDGER_TOLERANCE;
+    const settlementTtlMs = maxLedgerDelta * MAX_LEDGER_CLOSE_MS + SETTLEMENT_TTL_MS;
+    if (await this.settlementCache.isDuplicate(transactionHash, settlementTtlMs)) {
       return {
         success: false,
         transaction: "",
@@ -286,6 +293,14 @@ export class ExactXrplScheme implements SchemeNetworkFacilitator {
     }
     if (payload.accepted.maxTimeoutSeconds !== requirements.maxTimeoutSeconds) {
       return "invalid_exact_xrpl_max_timeout_mismatch";
+    }
+    if (
+      !Number.isInteger(requirements.maxTimeoutSeconds) ||
+      requirements.maxTimeoutSeconds <= 0 ||
+      requirements.maxTimeoutSeconds >
+        (this.options.maxTimeoutSeconds ?? DEFAULT_MAX_TIMEOUT_SECONDS)
+    ) {
+      return "invalid_exact_xrpl_max_timeout_out_of_policy";
     }
     if (
       requirements.extra?.areFeesSponsored !== false ||
@@ -391,7 +406,9 @@ export class ExactXrplScheme implements SchemeNetworkFacilitator {
     transaction: Payment,
     requirements: PaymentRequirements,
   ): string | undefined {
-    const destinationAmount = getDestinationAmount(transaction);
+    // The destination amount is always the decoded Amount field; DeliverMax
+    // is an API-level alias that never appears in binary-codec output.
+    const destinationAmount: unknown = transaction.Amount;
     if (typeof destinationAmount !== "string" || !/^\d+$/.test(destinationAmount)) {
       return "invalid_exact_xrpl_payload_amount_xrp";
     }
@@ -424,11 +441,13 @@ export class ExactXrplScheme implements SchemeNetworkFacilitator {
     transaction: Payment,
     requirements: PaymentRequirements,
   ): string | undefined {
-    const destinationAmount = getDestinationAmount(transaction);
+    const destinationAmount: unknown = transaction.Amount;
     if (!isIssuedCurrencyAmount(destinationAmount)) {
       return "invalid_exact_xrpl_payload_iou_amount";
     }
-    if (destinationAmount.currency !== requirements.asset) {
+    // The codec emits 3-char or uppercase 40-hex currencies; normalize the
+    // advertised asset to the same form so equivalent representations match.
+    if (destinationAmount.currency !== normalizeCurrencyCode(requirements.asset)) {
       return "invalid_exact_xrpl_payload_iou_currency_mismatch";
     }
     if (destinationAmount.issuer !== requirements.extra?.issuer) {
@@ -684,19 +703,6 @@ function invalidVerify(reason: string, payer: string, message?: string): VerifyR
     invalidMessage: message,
     payer,
   };
-}
-
-/**
- * Extracts the destination amount while rejecting ambiguous v1/v2 amount fields.
- *
- * @param transaction - Decoded XRPL payment transaction
- * @returns Destination amount
- */
-function getDestinationAmount(transaction: Payment): unknown {
-  if (transaction.Amount !== undefined && transaction.DeliverMax !== undefined) {
-    throw new Error("ambiguous_amount_fields");
-  }
-  return transaction.DeliverMax ?? transaction.Amount;
 }
 
 /**

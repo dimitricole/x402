@@ -69,7 +69,7 @@ Common XRPL network identifiers:
 | Devnet  | `xrpl:2`   |
 
 > [!WARNING]
-> For standard XRPL networks where `networkId <= 1024`, XRPL protocol rules require omitting the signed `NetworkID` field. Wallets SHOULD use separate XRPL accounts for mainnet, testnet, and devnet x402 payments. If the same account has funds and a compatible account sequence or ticket state on multiple standard networks, a malicious or misconfigured facilitator could replay a transaction signed for one network on another.
+> For standard XRPL networks where `networkId <= 1024`, XRPL protocol rules require omitting the signed `NetworkID` field, so nothing in the signature binds the transaction to one standard network. Wallets SHOULD use separate XRPL accounts for mainnet, testnet, and devnet x402 payments; see [§5. Network Binding](#5-network-binding) for the replay risk this mitigates.
 
 ## Protocol Flow
 
@@ -311,12 +311,7 @@ Clients and wallets SHOULD use different XRPL accounts for mainnet, testnet, dev
 
 ### 6. Amount Validation
 
-XRPL API v2 uses `DeliverMax`; API v1 uses `Amount`. The facilitator MUST determine the destination amount field:
-
-- If `tx_json.DeliverMax` is present, use it.
-- Else use `tx_json.Amount`.
-- If neither is present, reject.
-- If both are present, reject.
+The destination amount is the decoded `tx_json.Amount` field. `DeliverMax` is an API-level alias used by the rippled JSON API (v2); it does not exist in the XRPL binary codec, so it can never appear in a transaction decoded from `signedTxBlob`. If the destination amount is missing or malformed, reject.
 
 #### XRP Amount Rules
 
@@ -336,7 +331,7 @@ If `paymentRequirements.asset != "XRP"`:
   ```json
   { "currency": "...", "issuer": "...", "value": "..." }
   ```
-- `currency` MUST match `paymentRequirements.asset` (3-char or 160-bit hex).
+- `currency` MUST match `paymentRequirements.asset` (3-char or 160-bit hex). The two representations of the same currency MUST compare equal: the binary codec decodes standard currencies to their 3-character form and nonstandard currencies to uppercase hex, so implementations MUST normalize `paymentRequirements.asset` to that canonical form before comparing. 3-character codes themselves are case-sensitive (`USD` and `usd` are distinct currencies).
 - `issuer` MUST match `paymentRequirements.extra.issuer`.
 - `value` MUST equal `paymentRequirements.amount` using exact decimal arithmetic suitable for XRPL issued-currency values.
 
@@ -382,6 +377,7 @@ Recommended `LastLedgerSequence` policy:
 
 - Convert `maxTimeoutSeconds` to ledgers: `maxLedgerDelta = ceil(maxTimeoutSeconds / 5) + 2`.
 - Require: `LastLedgerSequence <= currentValidatedLedgerIndex + maxLedgerDelta`.
+- Clients SHOULD sign `LastLedgerSequence = currentValidatedLedgerIndex + ceil(maxTimeoutSeconds / 5)`, computed from their own node's validated ledger index. The two tolerance ledgers in the facilitator bound are left unused by the client so that a client node slightly ahead of the facilitator's node does not produce a rejection.
 
 Client requirements per method:
 
@@ -406,26 +402,27 @@ The facilitator MUST reject transactions with:
 - `Fee` above facilitator policy.
 - `Delegate` present.
 - `Memos` present.
+- `Signers` present (multisigned payments are not supported by this scheme).
 - `SendMax` present for XRP.
 - `Paths` present.
 - `DeliverMin` present.
 - `Flags` including `tfPartialPayment` (`0x00020000`).
-- Both `Amount` and `DeliverMax` present.
-- Neither `Amount` nor `DeliverMax` present.
+- `Amount` missing.
+- `maxTimeoutSeconds` above facilitator policy (it sizes both the accepted `LastLedgerSequence` window and duplicate-settlement retention, and it is supplied by the resource server, not the facilitator).
 
 ### 10. Signature Validation
 
-- `/verify` MUST validate the signature offline.
+- `/verify` MUST validate the signature offline. This scheme covers single-signature transactions only; multisigned transactions (`Signers` present) are rejected under section 9 because their full validity (quorum, signer weights) is not offline-checkable.
 - `/settle` MUST handle signature-related failures and report them appropriately.
 
 ### 11. Simulation
 
-`/verify` MUST check that the signed transaction would currently succeed on XRPL. Implementations SHOULD use XRPL transaction simulation when available.
+`/verify` MUST check that the signed transaction would currently succeed on XRPL. Implementations SHOULD use XRPL transaction simulation (`simulate`, rippled 2.4.0+) when available. The `simulate` method accepts only unsigned transactions, so the facilitator MUST strip `TxnSignature` and `SigningPubKey` from the decoded transaction before simulating; signature validity is covered separately by section 10.
 
 If simulation is unavailable, implementations MUST perform targeted checks that cover at least:
 
 - account existence for `tx_json.Account`;
-- account sequence currency or ticket availability, according to the selected asset transfer method;
+- account sequence currentness or ticket availability, according to the selected asset transfer method;
 - XRP balance sufficient for the transaction fee;
 - destination account existence or create-account funding rules for XRP payments;
 - IOU trust line existence, issuer, and balance sufficiency for IOU payments.
@@ -457,7 +454,7 @@ The facilitator SHOULD wait for a validated result before returning success to p
 
 #### Vulnerability
 
-Without a dedup guard, concurrent `/settle` calls carrying the same signed transaction blob each return a successful response. XRPL deduplicates the ledger effect — only one payment lands — but reliable submission is an idempotent read keyed on the transaction hash: submitting an already-known blob and waiting for its hash resolves with the same validated `tesSUCCESS` outcome for every caller instead of failing for all but the first. A malicious client can exploit this to obtain access to the resource N times while paying once.
+Without a dedup guard, concurrent `/settle` calls carrying the same signed transaction blob each return a successful response. XRPL deduplicates the ledger effect (only one payment lands), but reliable submission is an idempotent read keyed on the transaction hash: submitting an already-known blob and waiting for its hash resolves with the same validated `tesSUCCESS` outcome for every caller instead of failing for all but the first. A malicious client can exploit this to obtain access to the resource N times while paying once.
 
 Unlike a probabilistic confirmation race, this behavior is deterministic on XRPL, so the mitigation is REQUIRED rather than RECOMMENDED.
 
@@ -468,7 +465,7 @@ Facilitators MUST deduplicate in-flight settlements across every process that se
 1. After verification succeeds, derive the cache key from the signed transaction blob: the canonical XRPL transaction hash (as returned by, e.g., `hashSignedTx`).
 2. If the key is already present, reject the settlement with a `"duplicate_settlement"` error.
 3. If the key is not present, record it and proceed with submission.
-4. Retain the key until its transaction can no longer land — that is, until its `LastLedgerSequence` has passed (bounded by `maxTimeoutSeconds`; see [§7. Expiry and Account Sequencing](#7-expiry-and-account-sequencing)). A shorter window reopens the race: while the transaction is still landable, a re-submission passes re-verification because the consumed sequence number — or ticket — is not yet consumed, so the entry MUST outlive that window rather than a fixed interval. (Solana's fixed ~60-90s blockhash lifetime lets its cache use a constant TTL; XRPL's expiry is policy-derived, so the retention window is too.)
+4. Retain the key until its transaction can no longer land, that is, until its `LastLedgerSequence` has passed (bounded by `maxTimeoutSeconds`; see [§7. Expiry and Account Sequencing](#7-expiry-and-account-sequencing)). A shorter window reopens the race: while the transaction is still landable, a re-submission passes re-verification because its sequence number or ticket is not yet consumed, so the entry MUST outlive that window rather than a fixed interval. (Solana's fixed ~60-90s blockhash lifetime lets its cache use a constant TTL; XRPL's expiry is policy-derived, so the retention window is too.) The window is bounded in ledgers, not wall-clock time; implementations retaining by wall clock MUST size the retention from a conservative upper bound on ledger close time, not the nominal close time.
 
 The check and record MUST be performed atomically with respect to concurrent settlement requests. A single-process facilitator MAY satisfy this with an in-process map (checking and inserting synchronously between the verification result and the first subsequent suspension point); a horizontally scaled facilitator MUST use a shared store providing the same atomicity, otherwise duplicates routed to different replicas each pass their local guard.
 
@@ -528,4 +525,5 @@ Implementations MAY include additional fields when defined by the SDK or facilit
 - [XRPL Reserves](https://xrpl.org/docs/concepts/accounts/reserves)
 - [XRPL Currency Formats](https://xrpl.org/docs/references/protocol/data-types/currency-formats)
 - [CAIP-2 Specification](https://github.com/ChainAgnostic/CAIPs/blob/main/CAIPs/caip-2.md)
+- [CAIP-2 XRPL Namespace Profile](https://github.com/ChainAgnostic/namespaces/tree/main/xrpl)
 - [x402 Protocol Specification](https://github.com/coinbase/x402/blob/main/specs/x402-specification-v2.md)

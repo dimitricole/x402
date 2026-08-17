@@ -6,6 +6,7 @@ import { ExactXrplScheme as ExactXrplServerScheme } from "../../src/exact/server
 import { createXrplWalletSigner } from "../../src/signer";
 import {
   DEFAULT_MAX_FEE_DROPS,
+  MAX_LEDGER_CLOSE_MS,
   SETTLEMENT_TTL_MS,
   SettlementCache,
   XRPL_DEVNET,
@@ -14,8 +15,10 @@ import {
   createTickets,
   getXrplTicketSequences,
   invoiceIdToInvoiceIdField,
+  normalizeCurrencyCode,
   resolveAssetTransferMethod,
   simulateSignedTransaction,
+  type SettlementStore,
 } from "../../src";
 import { RLUSD_CURRENCY, RLUSD_TESTNET_ISSUER } from "../../src/defaultAssets";
 import type { PaymentPayload, PaymentRequirements } from "@x402/core/types";
@@ -127,7 +130,7 @@ async function preparePaymentForTest(transaction: Payment): Promise<Payment> {
 
 function createFacilitator(
   overrides: ConstructorParameters<typeof ExactXrplFacilitatorScheme>[0] = {},
-  settlementCache?: SettlementCache,
+  settlementCache?: SettlementStore,
 ): ExactXrplFacilitatorScheme {
   return new ExactXrplFacilitatorScheme(
     {
@@ -622,7 +625,7 @@ describe("ExactXrplScheme client", () => {
     expect(decoded.InvoiceID).toBe(invoiceIdToInvoiceIdField(invoiceId));
     expect(decoded.Sequence).toBe(1);
     expect(decoded.Fee).toBe(DEFAULT_MAX_FEE_DROPS);
-    expect(decoded.LastLedgerSequence).toBe(994);
+    expect(decoded.LastLedgerSequence).toBe(992);
   });
 
   it("creates a signed IOU payment payload with SendMax and destination tag", async () => {
@@ -647,7 +650,24 @@ describe("ExactXrplScheme client", () => {
     expect(decoded.DestinationTag).toBe(12345);
     expect(decoded.Sequence).toBe(1);
     expect(decoded.Fee).toBe(DEFAULT_MAX_FEE_DROPS);
-    expect(decoded.LastLedgerSequence).toBe(994);
+    expect(decoded.LastLedgerSequence).toBe(992);
+  });
+
+  it("normalizes lowercase hex currency codes before signing", async () => {
+    const client = new ExactXrplClientScheme(createXrplWalletSigner(payerWallet), {
+      getCurrentLedgerIndex: async () => 980,
+      preparePaymentTransaction: preparePaymentForTest,
+    });
+    const lowercaseHex = "aa15271cf5b573c40412ec5750a1e0e603ac016a";
+
+    const result = await client.createPaymentPayload(2, {
+      ...baseIouRequirements,
+      asset: lowercaseHex,
+    });
+    const decoded = decode(String(result.payload.signedTxBlob)) as Payment;
+
+    expect((decoded.Amount as { currency: string }).currency).toBe(lowercaseHex.toUpperCase());
+    expect((decoded.SendMax as { currency: string }).currency).toBe(lowercaseHex.toUpperCase());
   });
 
   it("creates a signed RLUSD payment when extra.issuer matches the network default", async () => {
@@ -842,13 +862,13 @@ describe("ExactXrplScheme client", () => {
     expect(fakeClient.getLedgerIndex).toHaveBeenCalledOnce();
     expect(autofill).toHaveBeenCalledWith(
       expect.objectContaining({
-        LastLedgerSequence: 994,
+        LastLedgerSequence: 992,
       }),
     );
     expect(fakeClient.disconnect).toHaveBeenCalledOnce();
     expect(decoded.Sequence).toBe(7);
     expect(decoded.Fee).toBe("12");
-    expect(decoded.LastLedgerSequence).toBe(994);
+    expect(decoded.LastLedgerSequence).toBe(992);
   });
 
   it("rejects custom preparers that do not populate ledger-derived fields", async () => {
@@ -1868,7 +1888,8 @@ describe("ExactXrplScheme facilitator settlement dedup", () => {
       const submitSignedTransaction = vi.fn(async () => successfulSubmission);
       const settleFacilitator = createFacilitator({ submitSignedTransaction });
       const payload = buildPayload(baseXrpRequirements);
-      const entryTtlMs = baseXrpRequirements.maxTimeoutSeconds * 1000 + SETTLEMENT_TTL_MS;
+      const maxLedgerDelta = Math.ceil(baseXrpRequirements.maxTimeoutSeconds / 5) + 2;
+      const entryTtlMs = maxLedgerDelta * MAX_LEDGER_CLOSE_MS + SETTLEMENT_TTL_MS;
 
       const first = await settleFacilitator.settle(payload, baseXrpRequirements);
       // Still within the landable window: a slow-to-validate duplicate must not
@@ -1903,5 +1924,105 @@ describe("ExactXrplScheme facilitator settlement dedup", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("awaits an asynchronous shared settlement store", async () => {
+    const seen = new Set<string>();
+    const asyncStore: SettlementStore = {
+      async isDuplicate(key: string): Promise<boolean> {
+        if (seen.has(key)) return true;
+        seen.add(key);
+        return false;
+      },
+    };
+    const submitSignedTransaction = vi.fn(async () => successfulSubmission);
+    const settleFacilitator = createFacilitator({ submitSignedTransaction }, asyncStore);
+    const payload = buildPayload(baseXrpRequirements);
+
+    const first = await settleFacilitator.settle(payload, baseXrpRequirements);
+    const second = await settleFacilitator.settle(payload, baseXrpRequirements);
+
+    expect(first.success).toBe(true);
+    expect(second.errorReason).toBe("duplicate_settlement");
+    expect(submitSignedTransaction).toHaveBeenCalledOnce();
+  });
+});
+
+describe("normalizeCurrencyCode", () => {
+  const hexUsd = "0000000000000000000000005553440000000000";
+
+  it("returns 3-char codes unchanged, preserving case", () => {
+    expect(normalizeCurrencyCode("USD")).toBe("USD");
+    expect(normalizeCurrencyCode("usd")).toBe("usd");
+  });
+
+  it("converts standard-layout hex to its 3-char form", () => {
+    expect(normalizeCurrencyCode(hexUsd)).toBe("USD");
+    expect(normalizeCurrencyCode(hexUsd.toLowerCase())).toBe("USD");
+  });
+
+  it("uppercases nonstandard hex", () => {
+    const rlusdHex = "524c555344000000000000000000000000000000";
+    expect(normalizeCurrencyCode(rlusdHex)).toBe(rlusdHex.toUpperCase());
+  });
+
+  it("keeps hex form when the standard slot holds non-ISO characters", () => {
+    expect(normalizeCurrencyCode("0".repeat(40))).toBe("0".repeat(40));
+    // `<` is allowed by xrpl.org's documented character set but rejected by
+    // ripple-binary-codec's ISO_REGEX; the codec's behavior is authoritative.
+    const hexWithAngleBracket = "000000000000000000000000413C420000000000";
+    expect(normalizeCurrencyCode(hexWithAngleBracket)).toBe(hexWithAngleBracket);
+  });
+
+  it("keeps hex form when the standard slot spells XRP, matching the codec", () => {
+    const hexXrp = "0000000000000000000000005852500000000000";
+    expect(normalizeCurrencyCode(hexXrp)).toBe(hexXrp);
+  });
+});
+
+describe("ExactXrplScheme facilitator policy", () => {
+  it("rejects maxTimeoutSeconds above the facilitator cap", async () => {
+    const facilitator = createFacilitator();
+    const requirements = { ...baseXrpRequirements, maxTimeoutSeconds: 100_000 };
+    const payload = buildPayload(requirements);
+
+    const result = await facilitator.verify(payload, requirements);
+
+    expect(result.isValid).toBe(false);
+    expect(result.invalidReason).toBe("invalid_exact_xrpl_max_timeout_out_of_policy");
+  });
+
+  it("honors a configured maxTimeoutSeconds cap", async () => {
+    const facilitator = createFacilitator({ maxTimeoutSeconds: 30 });
+    const payload = buildPayload(baseXrpRequirements);
+
+    const result = await facilitator.verify(payload, baseXrpRequirements);
+
+    expect(result.isValid).toBe(false);
+    expect(result.invalidReason).toBe("invalid_exact_xrpl_max_timeout_out_of_policy");
+  });
+
+  it("rejects non-integer and non-positive maxTimeoutSeconds", async () => {
+    const facilitator = createFacilitator();
+    for (const maxTimeoutSeconds of [60.5, 0, -1]) {
+      const requirements = { ...baseXrpRequirements, maxTimeoutSeconds };
+      const payload = buildPayload(requirements);
+
+      const result = await facilitator.verify(payload, requirements);
+
+      expect(result.isValid).toBe(false);
+      expect(result.invalidReason).toBe("invalid_exact_xrpl_max_timeout_out_of_policy");
+    }
+  });
+
+  it("accepts an IOU requirement advertised as standard-layout hex", async () => {
+    const hexUsd = "0000000000000000000000005553440000000000";
+    const requirements = { ...baseIouRequirements, asset: hexUsd };
+    const payload = buildPayload(requirements);
+    const facilitator = createFacilitator();
+
+    const result = await facilitator.verify(payload, requirements);
+
+    expect(result).toEqual({ isValid: true, payer: payerWallet.classicAddress });
   });
 });

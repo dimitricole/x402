@@ -28,6 +28,7 @@ The payer signs a complete XRPL `Payment` transaction and pays the XRPL transact
 - `createTickets(signer, network, ticketCount)` - Creates XRPL Tickets for `ticketSequence` payments.
 - `getXrplTicketSequences(account, network)` - Lists an account's available ticket sequences.
 - `invoiceIdToInvoiceIdField(invoiceId)` - Converts an invoice id to an XRPL `InvoiceID`.
+- `SettlementCache` / `SettlementStore` - Duplicate-settlement guard and the interface for shared stores.
 - XRPL network constants: `XRPL_MAINNET`, `XRPL_TESTNET`, `XRPL_DEVNET`.
 
 ### Subpath Exports
@@ -43,12 +44,14 @@ The payer signs a complete XRPL `Payment` transaction and pays the XRPL transact
 - `xrpl:2` - XRPL devnet.
 - `xrpl:<networkId>` - Custom XRPL networks with numeric `NetworkID`.
 
+Use separate XRPL accounts for mainnet, testnet, and devnet payments: standard networks omit the signed `NetworkID` field, so a transaction signed for one could be replayed on another. See the [spec's network binding section](../../../../specs/schemes/exact/scheme_exact_xrpl.md#5-network-binding).
+
 ## Asset Support
 
 - Native XRP: `asset` is `"XRP"` and `amount` is an integer drops string (1 XRP = 1,000,000 drops).
 - XRPL issued currencies (IOUs): `asset` is the currency code (3-character or 40-hex), `amount` is the exact XRPL issued-currency decimal `value` string (for example `"10.5"`), and `extra.issuer` is the issuer classic address.
 
-There is no `extra.decimals` field: XRPL issued-currency amounts are ledger decimal values, so the requirement `amount` is used verbatim as the signed `value`. XRPL exact payments use explicit `AssetAmount` pricing; dollar-string default asset mapping is not included for XRPL.
+There is no `extra.decimals` field: XRPL issued-currency amounts are ledger decimal values, so the requirement `amount` is used verbatim as the signed `value`. Prefer explicit `AssetAmount` pricing; dollar-string prices (for example `"$0.10"`) are also accepted and resolve to RLUSD via the network's default asset table (`getDefaultAsset`).
 
 ## Asset Transfer Methods
 
@@ -59,9 +62,7 @@ There is no `extra.decimals` field: XRPL issued-currency amounts are ledger deci
 
 The client follows the method pinned in the payment requirements and defaults to `"sequence"`. Resource servers offer `"ticketSequence"` by advertising it in `extra.assetTransferMethod` (optionally as a second `accepts` entry so clients can choose either method).
 
-For `"ticketSequence"` payments, the client automatically creates one ticket when none is
-available. Set `ticketCreateCount` to create more at once, or to `0` to disable automatic creation.
-To provision ticket inventory explicitly:
+To provision ticket inventory explicitly instead of relying on the client's automatic creation (see `ticketCreateCount` under Client):
 
 ```typescript
 import { Wallet } from "xrpl";
@@ -147,15 +148,31 @@ import { ExactXrplScheme } from "@x402/xrpl/exact/facilitator";
 const facilitator = new x402Facilitator().register("xrpl:*", new ExactXrplScheme());
 ```
 
-Verification enforces the spec's checks: envelope consistency, offline signature validation, signer-to-account authorization (the embedded `SigningPubKey` must be the account's master key pair, unless disabled, or its configured regular key), destination and amount matching, NetworkID binding, per-method sequencing (current account `Sequence`, or ticket availability), `LastLedgerSequence` expiry policy, invoice binding via `InvoiceID`, fee caps, safety rejections (`Delegate`, `Memos`, `Paths`, `DeliverMin`, partial payments, multisigned blobs), and an XRPL simulation. Settlement re-runs verification, submits the signed blob, and succeeds only on a validated `tesSUCCESS` result.
+Verification enforces the spec's checks: envelope consistency, offline signature validation, signer-to-account authorization (the embedded `SigningPubKey` must be the account's master key pair, unless disabled, or its configured regular key), destination and amount matching, NetworkID binding, per-method sequencing (current account `Sequence`, or ticket availability), `LastLedgerSequence` expiry policy, invoice binding via `InvoiceID`, fee caps, a `maxTimeoutSeconds` policy cap (option `maxTimeoutSeconds`, default 3600), safety rejections (`Delegate`, `Memos`, `Paths`, `DeliverMin`, partial payments, multisigned blobs), and an XRPL simulation. The facilitator's node must support the `simulate` API (rippled 2.4.0+). Settlement re-runs verification, submits the signed blob, and succeeds only on a validated `tesSUCCESS` result.
 
 ## Duplicate Settlement Protection
 
 This package includes a built-in `SettlementCache` that prevents a race condition where the same signed payment could be settled multiple times before its on-chain effects become visible: XRPL submission is idempotent on the transaction hash, so `submitAndWait` for an already-submitted blob resolves with the same validated `tesSUCCESS` outcome instead of failing.
 
-The cache rejects concurrent `/settle` calls that carry the same signed transaction blob, returning a `duplicate_settlement` error for the second and subsequent attempts. Entries are keyed on the signed transaction hash and retained for the transaction's landable window — sized from the payment's `maxTimeoutSeconds` (which bounds its `LastLedgerSequence`) — so an entry cannot be evicted while a slow-to-validate duplicate could still pass re-verification. Because entries are not cleared on failure, a `duplicate_settlement` result means the transaction was already seen, not that it settled.
+The cache rejects concurrent `/settle` calls that carry the same signed transaction blob, returning a `duplicate_settlement` error for the second and subsequent attempts. Entries are keyed on the signed transaction hash and retained for the transaction's landable window, sized from the payment's `maxTimeoutSeconds` (which bounds its `LastLedgerSequence`), so an entry cannot be evicted while a slow-to-validate duplicate could still pass re-verification. Because entries are not cleared on failure, a `duplicate_settlement` result means the transaction was already seen, not that it settled.
 
-**No additional configuration is required** — each `ExactXrplScheme` facilitator instance creates its own cache by default. Pass a shared `SettlementCache` as the second constructor argument if you register several scheme instances that should block each other's duplicates. This is a per-process guard: a horizontally scaled facilitator must back it with a shared atomic store so duplicates routed to different replicas are still caught.
+No additional configuration is required for a single process: each `ExactXrplScheme` facilitator instance creates its own cache by default, and you can pass a shared `SettlementCache` as the second constructor argument if several scheme instances should block each other's duplicates. A horizontally scaled facilitator must instead pass its own `SettlementStore` implementation backed by shared atomic storage (for example Redis `SET NX PX`):
+
+```typescript
+import type { SettlementStore } from "@x402/xrpl";
+
+const redisStore: SettlementStore = {
+  async isDuplicate(key, ttlMs) {
+    // SET NX is an atomic check-and-set: returns null when the key already exists.
+    return (await redis.set(`x402:settle:${key}`, "1", "PX", ttlMs, "NX")) === null;
+  },
+};
+
+const facilitator = new x402Facilitator().register(
+  "xrpl:*",
+  new ExactXrplScheme({}, redisStore),
+);
+```
 
 For full details on the race condition and mitigation strategy, see the [Exact XRPL Scheme Specification](../../../../specs/schemes/exact/scheme_exact_xrpl.md#duplicate-settlement-mitigation-required).
 

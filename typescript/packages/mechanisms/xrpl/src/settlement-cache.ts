@@ -1,15 +1,37 @@
 import { SETTLEMENT_TTL_MS } from "./constants";
 
 /**
+ * Duplicate-settlement guard consulted before submitting a verified
+ * transaction.
+ *
+ * Implementations must provide an atomic check-and-set: when several
+ * concurrent calls present the same key, exactly one may observe `false`.
+ * A horizontally scaled facilitator must implement this against a shared
+ * store with the same atomicity (for example Redis `SET NX PX`); see the
+ * spec's Duplicate Settlement Mitigation section for why.
+ */
+export type SettlementStore = {
+  /**
+   * Returns `true` if `key` is already pending settlement (duplicate),
+   * or `false` after atomically recording it as newly pending.
+   *
+   * @param key - The unique identifier for the settlement (the signed transaction hash).
+   * @param ttlMs - How long to retain the entry, in milliseconds; must cover the
+   *   transaction's landable window.
+   */
+  isDuplicate(key: string, ttlMs: number): boolean | Promise<boolean>;
+};
+
+/**
  * In-memory cache for deduplicating concurrent settlement requests.
  *
  * XRPL transaction submission is idempotent on the transaction hash:
  * `submitAndWait` for an already-submitted hash resolves with the same
  * `tesSUCCESS` outcome instead of failing, so every concurrent `/settle`
  * call carrying the same signed blob would otherwise report success.
- * Because Node.js is single-threaded, no lock is required — the cache
- * check + insert must simply occur before the first `await` in the
- * settle path.
+ * Because Node.js is single-threaded, no lock is required: the cache
+ * check + insert is synchronous, so it is atomic with respect to
+ * concurrent settle calls in the same process.
  *
  * Unlike Solana, whose blockhash lifetime bounds the replay window at a
  * protocol-fixed ~60-90s, an XRPL transaction stays landable until its
@@ -20,11 +42,11 @@ import { SETTLEMENT_TTL_MS } from "./constants";
  *
  * A scheme instance creates its own cache by default; pass a shared
  * instance to the constructor when several scheme instances should
- * block each other's duplicates. This is a per-process guard — a
- * horizontally scaled facilitator must back it with a shared atomic
- * store so duplicates routed to different replicas are still caught.
+ * block each other's duplicates. This is a per-process guard; a
+ * horizontally scaled facilitator must pass a {@link SettlementStore}
+ * backed by a shared atomic store instead.
  */
-export class SettlementCache {
+export class SettlementCache implements SettlementStore {
   /** Maps a settlement key to the absolute time (ms epoch) it may be evicted. */
   private readonly entries = new Map<string, number>();
 

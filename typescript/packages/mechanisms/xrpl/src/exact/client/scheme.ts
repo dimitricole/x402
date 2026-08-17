@@ -1,7 +1,7 @@
 import {
   createTickets,
   createXrplClient,
-  getMaxLastLedgerSequence,
+  getDefaultLastLedgerSequence,
   getXrplTicketSequences,
   invoiceIdToInvoiceIdField,
   isDecimalString,
@@ -9,6 +9,7 @@ import {
   isValidDestinationTag,
   isXrplAssetTransferMethod,
   isXrplNetwork,
+  normalizeCurrencyCode,
   parseXrplNetworkId,
 } from "../../utils";
 import type { ClientXrplSigner, XrplAssetTransferMethod, XrplClientOptions } from "../../types";
@@ -87,7 +88,7 @@ export class ExactXrplScheme implements SchemeNetworkClient {
     const lastLedgerSequence =
       currentLedgerIndex === undefined
         ? undefined
-        : getMaxLastLedgerSequence(currentLedgerIndex, requirements);
+        : getDefaultLastLedgerSequence(currentLedgerIndex, requirements);
     const invoiceId =
       typeof requirements.extra?.invoiceId === "string" ? requirements.extra.invoiceId : undefined;
     const destinationTag = requirements.extra?.destinationTag;
@@ -100,13 +101,17 @@ export class ExactXrplScheme implements SchemeNetworkClient {
     let amount: Payment["Amount"] = requirements.amount;
     let sendMax: Payment["SendMax"];
     if (!isXrp) {
+      // Normalize so the signed blob decodes to the codec-canonical currency
+      // the facilitator compares against, even if the requirement advertised
+      // lowercase hex or the hex form of a standard 3-char code.
+      const currency = normalizeCurrencyCode(requirements.asset);
       amount = {
-        currency: requirements.asset,
+        currency,
         issuer: String(requirements.extra?.issuer),
         value: requirements.amount,
       };
       sendMax = {
-        currency: requirements.asset,
+        currency,
         issuer: String(requirements.extra?.issuer),
         value: requirements.amount,
       };
@@ -212,7 +217,7 @@ export class ExactXrplScheme implements SchemeNetworkClient {
         ...transaction,
         LastLedgerSequence:
           transaction.LastLedgerSequence ??
-          getMaxLastLedgerSequence(currentLedgerIndex, requirements),
+          getDefaultLastLedgerSequence(currentLedgerIndex, requirements),
       };
 
       return client.autofill(paymentWithExpiry);

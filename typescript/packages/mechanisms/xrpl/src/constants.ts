@@ -76,6 +76,27 @@ export const MAX_DESTINATION_TAG = 0xffffffff;
 export const MAX_ACCOUNT_TICKETS = 250;
 
 /**
+ * Conservative upper bound on a single ledger close, in milliseconds.
+ *
+ * Mainnet ledgers close every 3-5 seconds. Settlement-cache retention is
+ * sized in wall-clock time from the transaction's remaining ledger window,
+ * so it multiplies the ledger count by this bound rather than the nominal
+ * close time: an entry must outlive the window even when the network closes
+ * ledgers well slower than usual.
+ */
+export const MAX_LEDGER_CLOSE_MS = 10_000;
+
+/**
+ * Default upper bound the facilitator accepts for maxTimeoutSeconds.
+ *
+ * maxTimeoutSeconds is supplied by the resource server, not the facilitator,
+ * and it sizes both the accepted LastLedgerSequence window and settlement
+ * cache retention; without a ceiling a misconfigured or hostile requirement
+ * could keep transactions landable (and cache entries live) indefinitely.
+ */
+export const DEFAULT_MAX_TIMEOUT_SECONDS = 3600;
+
+/**
  * Default (and minimum) settlement cache TTL in milliseconds.
  *
  * A cached entry must outlive its transaction's landable window: while the

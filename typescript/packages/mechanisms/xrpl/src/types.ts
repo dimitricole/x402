@@ -170,6 +170,10 @@ export type XrplFacilitatorOptions = {
    */
   maxFeeDrops?: string;
   /**
+   * Maximum accepted requirements.maxTimeoutSeconds.
+   */
+  maxTimeoutSeconds?: number;
+  /**
    * Optional function used to fetch current validated ledger index.
    */
   getCurrentLedgerIndex?: (network: Network) => Promise<number>;
